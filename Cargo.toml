@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "foxhole-tray"
 path = "src/bin/foxhole-tray.rs"
 
+[build-dependencies]
+# Embeds the version info, icon and application manifest (build.rs; Windows targets only).
+embed-resource = "3"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
