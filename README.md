@@ -14,6 +14,10 @@ Only most things. Sites or apps which serve their own video ads (Such as Youtube
 
 Content blocking of any kind implies a risk of bumping into false positives. You might also find that sponsored links on some shopping sites are non-responsive, if they show at all. If you're encountering unexpected connection issues, try disabling protection via the tray icon.
 
+## How do I uninstall Foxhole?
+
+Right click the windows icon on your taskbar, select Installed Apps, scroll to Foxhole DNS Ad Blocker, click the hamburger menu to the right and then Uninstall.
+
 ## Thanks and considerations
 
 Thanks to my longtime friend RocketKnight1 for his improvements upon my initial implementation and to the Hagezi team whose tireless work makes the internet a better place for all of us.
