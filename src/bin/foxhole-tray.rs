@@ -331,7 +331,7 @@ mod app {
                         SvcState::NotInstalled => (
                             make_icon([200, 60, 60], false),
                             "Foxhole — not installed",
-                            "Not installed — run foxhole.exe".to_string(),
+                            "Not installed — run the Foxhole installer".to_string(),
                             "Turn protection on",
                             false,
                         ),
