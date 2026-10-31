@@ -24,6 +24,10 @@ It's brand new software, so smartscreen might complain. Feel free to create an i
 
 Right click the windows icon on your taskbar, select Installed Apps, scroll to Foxhole DNS Ad Blocker, click the hamburger menu to the right and then Uninstall.
 
+## Is there a way I can help support development?
+
+Feel free to leave me a tip over on my Ko-Fi: https://ko-fi.com/flashfennec
+
 ## Thanks and considerations
 
 Thanks to my longtime friend RocketKnight1 for his improvements upon my initial implementation and to the Hagezi team whose tireless work makes the internet a better place for all of us.
