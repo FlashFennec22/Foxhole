@@ -12,7 +12,7 @@ Only most things. Sites or apps which serve their own video ads (Such as Youtube
 
 ## What should I be aware of?
 
-Content blocking of any kind implies a risk of bumping into false positives. You might also find that sponsored links on some shopping sites are non-responsive, if they show at all. If you're encountering unexpected connection issues, try disabling protection via the tray icon.
+Content blocking of any kind implies a risk of bumping into false positives. You might also find that sponsored links on some shopping sites are non-responsive, if they show at all. If you're encountering unexpected connection issues, try disabling protection via the tray icon. If ads aren't being blocked as expected, go to your browser's DNS settings and ensure that it's set to use system DNS.
 
 ## How do I install Foxhole?
 
