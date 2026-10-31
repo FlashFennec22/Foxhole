@@ -1,2 +1,2 @@
 # Foxhole
-Rust-based System Level Adblocker
+## A Rust-based System Level Adblocker
