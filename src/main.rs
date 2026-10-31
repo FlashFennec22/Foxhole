@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Install (if needed) and turn protection on. This is also what double-clicking does.
+    /// Turn protection on (and restart it, to apply config changes). This is also what double-clicking does.
     On {
         #[arg(long, hide = true)]
         pause: bool,
@@ -41,14 +41,8 @@ enum Cmd {
     Off,
     /// Show whether protection is running
     Status,
-    /// Remove Foxhole completely and restore DNS settings
-    Uninstall {
-        /// Also delete settings, cached blocklists and logs
-        #[arg(long)]
-        purge: bool,
-        #[arg(long, hide = true)]
-        pause: bool,
-    },
+    /// Open the uninstaller (restores your DNS settings and removes Foxhole)
+    Uninstall,
     /// Run in the foreground for debugging (Ctrl+C to stop)
     Run {
         /// Don't touch Windows' DNS settings; just listen on 127.0.0.1:53
@@ -58,6 +52,15 @@ enum Cmd {
     /// Internal: entry point used by the Windows Service Control Manager
     #[command(hide = true)]
     Service,
+    /// Internal (installer): register the service for this exe and start it
+    #[command(hide = true)]
+    InstallService,
+    /// Internal (installer): stop the service and tray icons before an upgrade replaces the files
+    #[command(hide = true)]
+    PrepareUpgrade,
+    /// Internal (uninstaller): restore DNS and remove the service
+    #[command(hide = true)]
+    UninstallService,
 }
 
 fn init_logging(to_file: bool) {
@@ -153,31 +156,7 @@ fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
             println!("Foxhole is OFF. Your original DNS settings were restored.");
             Ok(())
         }
-        Cmd::Uninstall { purge, pause: p } => {
-            let mut args = vec!["uninstall"];
-            if purge { args.push("--purge"); }
-            if p { args.push("--pause"); }
-            if let Some(code) = elevate(&args)? { std::process::exit(code as i32); }
-            init_logging(false);
-
-            let mut purge = purge;
-            if p && !purge {
-                print!("Also delete your settings, cached blocklists and logs? [y/N] ");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                let mut line = String::new();
-                let _ = std::io::stdin().read_line(&mut line);
-                purge = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-            }
-
-            let r = winctl::uninstall(purge);
-            match &r {
-                Ok(()) => println!("\nFoxhole was removed and your DNS settings were restored."),
-                Err(e) => println!("\nUninstall problem: {e:#}"),
-            }
-            if p { pause(); }
-            if r.is_ok() { winctl::remove_install_dir(); }
-            r
-        }
+        Cmd::Uninstall => winctl::run_uninstaller(),
         Cmd::Status => {
             println!("{}", match winctl::status() {
                 Status::Running => "ON (service running)",
@@ -190,6 +169,22 @@ fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
         Cmd::Service => {
             init_logging(true);
             service::dispatch().map_err(Into::into)
+        }
+        // Run by the (already elevated) installer with no console; details go to foxhole.log.
+        Cmd::InstallService | Cmd::PrepareUpgrade | Cmd::UninstallService => {
+            init_logging(true);
+            if !winctl::is_admin() {
+                anyhow::bail!("this command is for the installer and needs administrator rights");
+            }
+            let r = match cmd {
+                Cmd::InstallService => winctl::install_service(),
+                Cmd::PrepareUpgrade => winctl::prepare_upgrade(),
+                _ => winctl::uninstall_service(),
+            };
+            if let Err(e) = &r {
+                tracing::error!(error = %format!("{e:#}"), "installer step failed");
+            }
+            r
         }
         Cmd::Run { .. } => unreachable!(),
     }

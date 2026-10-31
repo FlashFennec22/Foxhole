@@ -1,15 +1,16 @@
-//! Install / start / stop / uninstall the Windows service through the Service Control Manager API,
-//! plus UAC self-elevation.
+//! Service registration and control through the Service Control Manager API, plus UAC
+//! self-elevation. Copying files, the Installed-apps entry and removal are the installer's job
+//! (installer/foxhole.iss); it calls the hidden `install-service`, `prepare-upgrade` and
+//! `uninstall-service` commands below.
 
-use crate::{config::{data_dir, Config}, service::SERVICE_NAME, sysdns, trayctl};
+use crate::{config::Config, service::SERVICE_NAME, sysdns, trayctl};
 use anyhow::{bail, Context, Result};
 use std::{
     ffi::OsString,
     io,
     mem::size_of,
-    os::windows::{ffi::OsStrExt, io::{AsRawHandle, FromRawHandle, OwnedHandle}, process::CommandExt},
+    os::windows::{ffi::OsStrExt, io::{AsRawHandle, FromRawHandle, OwnedHandle}},
     path::{Path, PathBuf},
-    process::Command,
     ptr,
     time::{Duration, Instant},
 };
@@ -39,13 +40,13 @@ use windows_sys::Win32::{
         WindowsAndMessaging::SW_SHOWNORMAL,
     },
 };
-use winreg::{enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}, RegKey};
+use winreg::{enums::{HKEY_CURRENT_USER, KEY_SET_VALUE}, RegKey};
 
 const DISPLAY_NAME: &str = "Foxhole DNS Ad Blocker";
 const TRAY_EXE: &str = "foxhole-tray.exe";
-const UNINSTALL_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Foxhole";
+/// Inno Setup's uninstaller, next to the installed exes.
+const UNINSTALLER_EXE: &str = "unins000.exe";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Service ACL: SYSTEM + Administrators keep full control; interactive users may query,
 /// START and STOP the service (so the tray can toggle without UAC) but NOT change its config.
@@ -171,10 +172,6 @@ fn set_security(svc: &Service, sddl: &str) -> io::Result<()> {
     if ok == 0 { Err(err) } else { Ok(()) }
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
-    a.display().to_string().eq_ignore_ascii_case(&b.display().to_string())
-}
-
 fn tray_running() -> bool {
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snap == INVALID_HANDLE_VALUE {
@@ -213,63 +210,40 @@ pub fn close_trays() -> bool {
     !tray_running()
 }
 
+/// The folder holding the installed exes (wherever the installer put them).
+fn exe_dir() -> Result<PathBuf> {
+    Ok(std::env::current_exe()?.parent().context("exe has no parent folder")?.to_path_buf())
+}
+
 /// Start the tray app (best effort). Call from a NON-elevated process so it runs as the user.
 pub fn launch_tray() {
-    let p = install_dir().join(TRAY_EXE);
-    if p.exists() {
-        let _ = shell_execute("open", &p, "");
+    if let Ok(p) = exe_dir().map(|d| d.join(TRAY_EXE)) {
+        if p.exists() {
+            let _ = shell_execute("open", &p, "");
+        }
     }
 }
 
-/// Adds the entry shown in Settings -> Apps -> Installed apps.
-fn register_uninstall(exe: &Path) -> io::Result<()> {
-    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(UNINSTALL_KEY)?;
-    let exe_s = exe.display().to_string();
-    key.set_value("DisplayName", &DISPLAY_NAME)?;
-    key.set_value("DisplayVersion", &env!("CARGO_PKG_VERSION"))?;
-    key.set_value("Publisher", &"Foxhole")?;
-    key.set_value("InstallLocation", &install_dir().display().to_string())?;
-    key.set_value("DisplayIcon", &exe_s)?;
-    key.set_value("UninstallString", &format!("\"{exe_s}\" uninstall --pause"))?;
-    key.set_value("NoModify", &1u32)?;
-    key.set_value("NoRepair", &1u32)?;
+/// Opens the uninstaller (it asks for administrator rights itself).
+pub fn run_uninstaller() -> Result<()> {
+    let p = exe_dir()?.join(UNINSTALLER_EXE);
+    if !p.exists() {
+        bail!("uninstaller not found; remove Foxhole from Settings > Apps > Installed apps instead");
+    }
+    shell_execute("open", &p, "").context("starting the uninstaller")?;
     Ok(())
 }
 
-fn install_dir() -> PathBuf {
-    std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files")).join("Foxhole")
-}
-
-/// Copy the exe to Program Files and (re)register the service with auto-start + auto-restart.
-fn install() -> Result<()> {
-    let dir = install_dir();
-    let target = dir.join("foxhole.exe");
-    let current = std::env::current_exe()?;
-    if !stop() {
-        bail!("the Foxhole service didn't stop; try again in a moment");
-    }
-    let trays_closed = close_trays(); // a running exe can't be overwritten
-    if !same_path(&current, &target) {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::copy(&current, &target).with_context(|| format!("copying to {}", target.display()))?;
-    }
-    if let Some(src_dir) = current.parent() {
-        let (src, dst) = (src_dir.join(TRAY_EXE), dir.join(TRAY_EXE));
-        if src.exists() && !same_path(&src, &dst) {
-            if let Err(e) = std::fs::copy(&src, &dst) {
-                if trays_closed { return Err(e).with_context(|| format!("copying to {}", dst.display())); }
-                println!("Note: the tray icon is still running, so it wasn't updated. Quit it and run this again to update it.");
-            }
-        }
-    }
-
+/// Installer, after copying files: (re)register the service for this exe and start it.
+pub fn install_service() -> Result<()> {
+    Config::load_or_create()?; // validates / creates config before we start
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: DISPLAY_NAME.into(),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: target.clone(),
+        executable_path: std::env::current_exe()?,
         launch_arguments: vec!["service".into()],
         dependencies: vec![],
         account_name: None, // LocalSystem
@@ -287,7 +261,7 @@ fn install() -> Result<()> {
             .context("creating the service")?,
     };
     if let Err(e) = set_security(&svc, SERVICE_SDDL) {
-        println!("Warning: could not set service permissions ({e}); the tray icon may need admin rights to toggle.");
+        tracing::warn!(error = %e, "could not set service permissions; the tray icon may need admin rights to toggle");
     }
     let _ = svc.set_description("Local DNS resolver that blocks ads and trackers.");
     // If the process ever dies, restart it quickly so DNS never stays pointed at a dead resolver.
@@ -298,18 +272,55 @@ fn install() -> Result<()> {
         command: None,
         actions: Some(vec![restart(2), restart(5), restart(30)]),
     });
-    if let Err(e) = register_uninstall(&target) {
-        println!("Warning: could not register in Installed apps: {e}");
+    drop(svc);
+    tracing::info!("service registered");
+    turn_on()
+}
+
+/// Installer, before replacing files on an upgrade: stop the service and close the tray icons.
+pub fn prepare_upgrade() -> Result<()> {
+    // Trays first, so none can restart the service in between.
+    if !close_trays() {
+        tracing::warn!("a tray icon is still running");
+    }
+    if !stop() {
+        bail!("the Foxhole service didn't stop"); // the service restores DNS as it stops
     }
     Ok(())
 }
 
+/// Uninstaller, before deleting files: stop, restore DNS, remove the service and autostart entry.
+pub fn uninstall_service() -> Result<()> {
+    // Trays first, so none can restart the service while it is being removed.
+    close_trays();
+    if let Err(e) = turn_off() {
+        tracing::warn!(error = %format!("{e:#}"), "problem turning protection off; removing the service anyway");
+    }
+    if let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
+        let _ = run.delete_value("Foxhole");
+    }
+    if let Some(svc) = open(ServiceAccess::DELETE) {
+        svc.delete().context("deleting the service")?;
+        drop(svc); // the service disappears once the last handle is closed
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while status() != Status::NotInstalled && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    tracing::info!("service removed");
+    Ok(())
+}
+
+/// Enables autostart and (re)starts the service, so edits to config.toml take effect.
 pub fn turn_on() -> Result<()> {
-    Config::load_or_create()?; // validates / creates config before we start
-    println!("Installing service...");
-    install()?;
-    println!("Starting...");
-    let started = open(ServiceAccess::START).context("service not found after install")?.start::<OsString>(&[]);
+    let Some(svc) = open(ServiceAccess::CHANGE_CONFIG | ServiceAccess::START) else {
+        bail!("Foxhole isn't installed. Run the Foxhole installer (Foxhole-Setup-*.exe) first.");
+    };
+    set_auto_start(&svc, true)?;
+    if !stop() {
+        bail!("the Foxhole service didn't stop; try again in a moment");
+    }
+    let started = svc.start::<OsString>(&[]);
     // The service reports RUNNING only once it is listening on port 53, and stops if it can't.
     if wait_settled(30) != Status::Running {
         let why = started.err().map(|e| format!("\n{e}")).unwrap_or_default();
@@ -329,49 +340,4 @@ pub fn turn_off() -> Result<()> {
     }
     let restored = sysdns::restore(); // idempotent safety net in case the service died uncleanly
     result.and(restored)
-}
-
-/// Full removal: stop, restore DNS, delete the service and registry entries.
-/// `purge` also deletes settings, cached lists and logs in %ProgramData%\Foxhole.
-/// Program Files is removed afterwards by `remove_install_dir()`, once this process is done.
-pub fn uninstall(purge: bool) -> Result<()> {
-    // Close the tray icons first, so none can restart the service while it is being removed.
-    close_trays();
-    println!("Stopping protection and restoring your DNS settings...");
-    if let Err(e) = turn_off() {
-        println!("Warning: {e:#}");
-    }
-
-    println!("Removing service...");
-    if let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, winreg::enums::KEY_SET_VALUE) {
-        let _ = run.delete_value("Foxhole");
-    }
-    if let Some(svc) = open(ServiceAccess::DELETE) {
-        let _ = svc.delete();
-        drop(svc); // the service disappears once the last handle is closed
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while status() != Status::NotInstalled && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(300));
-        }
-    }
-    let _ = RegKey::predef(HKEY_LOCAL_MACHINE).delete_subkey_all(UNINSTALL_KEY);
-
-    if purge {
-        println!("Deleting settings, cached lists and logs...");
-        let _ = std::fs::remove_dir_all(data_dir());
-    }
-    Ok(())
-}
-
-/// Deletes C:\Program Files\Foxhole shortly after this process exits (a running exe can't delete itself).
-pub fn remove_install_dir() {
-    let dir = install_dir();
-    // Safety: never run a recursive delete on anything that isn't our own folder.
-    if dir.file_name().map_or(true, |n| !n.eq_ignore_ascii_case("Foxhole")) {
-        return;
-    }
-    let _ = Command::new("cmd.exe")
-        .raw_arg(format!("/C ping -n 4 127.0.0.1 >nul & rmdir /S /Q \"{}\"", dir.display()))
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
 }
