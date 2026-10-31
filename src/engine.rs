@@ -51,8 +51,12 @@ pub async fn run(cfg: Config, shutdown: Arc<Notify>, manage_dns: bool) -> Result
             _ = shutdown.notified() => break,
             _ = tick.tick() => {}
             _ = async { match &watcher { Some(w) => w.changed().await, None => std::future::pending().await } } => {
-                // Changes arrive in bursts (link up, DHCP, IPv6 autoconfiguration): let them settle.
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                // Changes arrive in bursts (link up, DHCP, IPv6 autoconfiguration): let them settle,
+                // without delaying a shutdown that arrives meanwhile.
+                tokio::select! {
+                    _ = shutdown.notified() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
             }
         }
         if manage_dns {
