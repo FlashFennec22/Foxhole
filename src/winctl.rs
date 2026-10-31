@@ -121,13 +121,27 @@ fn wait_for(target: Status, secs: u64) -> bool {
     status() == target
 }
 
-fn stop() {
+/// Waits (up to `secs`) for a start or stop in progress to finish, and returns the outcome.
+fn wait_settled(secs: u64) -> Status {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let s = status();
+        if s != Status::Other || Instant::now() >= deadline {
+            return s;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Stops the service if it is running. Returns false if it is still running afterwards.
+fn stop() -> bool {
     if let Some(svc) = open(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS) {
-        if status() != Status::Stopped {
+        if wait_settled(15) != Status::Stopped {
             let _ = svc.stop();
-            wait_for(Status::Stopped, 15);
+            return wait_for(Status::Stopped, 15);
         }
     }
+    true
 }
 
 /// Switches between automatic start (protection on at boot) and manual start (stays off).
@@ -231,7 +245,9 @@ fn install() -> Result<()> {
     let dir = install_dir();
     let target = dir.join("foxhole.exe");
     let current = std::env::current_exe()?;
-    stop();
+    if !stop() {
+        bail!("the Foxhole service didn't stop; try again in a moment");
+    }
     let trays_closed = close_trays(); // a running exe can't be overwritten
     if !same_path(&current, &target) {
         std::fs::create_dir_all(&dir)?;
@@ -294,31 +310,39 @@ pub fn turn_on() -> Result<()> {
     install()?;
     println!("Starting...");
     let started = open(ServiceAccess::START).context("service not found after install")?.start::<OsString>(&[]);
-    if !wait_for(Status::Running, 10) {
+    // The service reports RUNNING only once it is listening on port 53, and stops if it can't.
+    if wait_settled(30) != Status::Running {
         let why = started.err().map(|e| format!("\n{e}")).unwrap_or_default();
         bail!("service did not start. See %ProgramData%\\Foxhole\\foxhole.log{why}");
     }
     Ok(())
 }
 
+/// Best effort: even if one step fails, the others (above all restoring DNS) still run.
 pub fn turn_off() -> Result<()> {
+    let mut result = Ok(());
     if let Some(svc) = open(ServiceAccess::CHANGE_CONFIG) {
-        set_auto_start(&svc, false)?; // stay off across reboots
-        stop();
+        result = set_auto_start(&svc, false); // stay off across reboots
+        if !stop() {
+            result = result.and(Err(anyhow::anyhow!("the Foxhole service didn't stop")));
+        }
     }
-    sysdns::restore()?; // idempotent safety net in case the service died uncleanly
-    Ok(())
+    let restored = sysdns::restore(); // idempotent safety net in case the service died uncleanly
+    result.and(restored)
 }
 
 /// Full removal: stop, restore DNS, delete the service and registry entries.
 /// `purge` also deletes settings, cached lists and logs in %ProgramData%\Foxhole.
 /// Program Files is removed afterwards by `remove_install_dir()`, once this process is done.
 pub fn uninstall(purge: bool) -> Result<()> {
+    // Close the tray icons first, so none can restart the service while it is being removed.
+    close_trays();
     println!("Stopping protection and restoring your DNS settings...");
-    turn_off()?;
+    if let Err(e) = turn_off() {
+        println!("Warning: {e:#}");
+    }
 
     println!("Removing service...");
-    close_trays();
     if let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, winreg::enums::KEY_SET_VALUE) {
         let _ = run.delete_value("Foxhole");
     }
