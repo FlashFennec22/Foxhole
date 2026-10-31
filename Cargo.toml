@@ -16,8 +16,10 @@ path = "src/bin/foxhole-tray.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hickory-proto = "0.24"
-# native-tls = Windows SChannel: uses the Windows certificate store, no C toolchain needed
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "http2"] }
+# native-tls = Windows SChannel: uses the Windows certificate store, no C toolchain needed.
+# native-tls-alpn is required for HTTP/2: without ALPN, reqwest can only speak HTTP/1.1 over
+# native-tls, so concurrent DoH queries each need their own TLS connection instead of sharing one.
+reqwest = { version = "0.12", default-features = false, features = ["native-tls-alpn", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
