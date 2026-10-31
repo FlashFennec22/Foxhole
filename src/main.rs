@@ -97,7 +97,7 @@ fn run_foreground(manage_dns: bool) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             s2.notify_one();
         });
-        engine::run(cfg, shutdown, manage_dns).await
+        engine::run(cfg, shutdown, manage_dns, || {}).await
     })
 }
 
@@ -142,7 +142,9 @@ fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
             }
             if r.is_ok() && !no_tray { winctl::launch_tray(); }
             if p { pause(); }
-            r
+            // The error was already shown above; just report it through the exit code.
+            if r.is_err() { std::process::exit(1); }
+            Ok(())
         }
         Cmd::Off => {
             if let Some(code) = elevate(&["off"])? { std::process::exit(code as i32); }

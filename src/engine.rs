@@ -5,8 +5,9 @@ use tokio::{net::{TcpListener, UdpSocket}, sync::Notify};
 use tracing::{info, warn};
 
 /// Runs the resolver until `shutdown` is notified. If `manage_dns`, points Windows at us
-/// while running and restores the original settings on exit.
-pub async fn run(cfg: Config, shutdown: Arc<Notify>, manage_dns: bool) -> Result<()> {
+/// while running and restores the original settings on exit. `on_ready` is called once the
+/// DNS listeners are bound, i.e. once the resolver can actually answer.
+pub async fn run(cfg: Config, shutdown: Arc<Notify>, manage_dns: bool, on_ready: impl FnOnce()) -> Result<()> {
     let upstream = Upstream::new(&cfg.upstream)?;
 
     // Start protecting immediately from the cached lists; fresh downloads swap in later.
@@ -33,6 +34,7 @@ pub async fn run(cfg: Config, shutdown: Arc<Notify>, manage_dns: bool) -> Result
         _ => warn!("could not listen on [::1]:53; IPv6 DNS server entry will not be set"),
     }
     info!(ipv6, "DNS listener ready on loopback port 53");
+    on_ready();
 
     tokio::spawn(updater(cfg.clone(), state.clone()));
     tokio::spawn(stats_writer(state.clone()));
