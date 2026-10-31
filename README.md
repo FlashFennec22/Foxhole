@@ -18,6 +18,8 @@ Content blocking of any kind implies a risk of bumping into false positives. You
 
 Download the installer at the releases page: https://github.com/FlashFennec22/Foxhole/releases
 
+It's brand new software, so smartscreen might complain. Feel free to create an issue if you encounter any other installation problems.
+
 ## How do I uninstall Foxhole?
 
 Right click the windows icon on your taskbar, select Installed Apps, scroll to Foxhole DNS Ad Blocker, click the hamburger menu to the right and then Uninstall.
