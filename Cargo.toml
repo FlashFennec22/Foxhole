@@ -32,9 +32,16 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+winreg = "0.55"
 # tray app (src/bin/foxhole-tray.rs); tray-icon 0.19 pairs with tao 0.30
 tray-icon = "0.19"
 tao = "0.30"
