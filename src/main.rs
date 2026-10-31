@@ -54,7 +54,11 @@ enum Cmd {
     Service,
     /// Internal (installer): register the service for this exe and start it
     #[command(hide = true)]
-    InstallService,
+    InstallService {
+        /// Register it with protection off (manual start), e.g. when upgrading an install that was off
+        #[arg(long)]
+        off: bool,
+    },
     /// Internal (installer): stop the service and tray icons before an upgrade replaces the files
     #[command(hide = true)]
     PrepareUpgrade,
@@ -171,13 +175,13 @@ fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
             service::dispatch().map_err(Into::into)
         }
         // Run by the (already elevated) installer with no console; details go to foxhole.log.
-        Cmd::InstallService | Cmd::PrepareUpgrade | Cmd::UninstallService => {
+        Cmd::InstallService { .. } | Cmd::PrepareUpgrade | Cmd::UninstallService => {
             init_logging(true);
             if !winctl::is_admin() {
                 anyhow::bail!("this command is for the installer and needs administrator rights");
             }
             let r = match cmd {
-                Cmd::InstallService => winctl::install_service(),
+                Cmd::InstallService { off } => winctl::install_service(off),
                 Cmd::PrepareUpgrade => winctl::prepare_upgrade(),
                 _ => winctl::uninstall_service(),
             };

@@ -61,6 +61,9 @@ Type: dirifempty; Name: "{app}"
 Filename: "{app}\foxhole-tray.exe"; Description: "Show the Foxhole icon in the notification area"; Flags: nowait postinstall runasoriginaluser
 
 [Code]
+var
+  WasOff: Boolean;
+
 function RunFoxhole(const Params: String): Integer;
 begin
   if not Exec(ExpandConstant('{app}\foxhole.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Result) then
@@ -68,8 +71,12 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  StartType: Cardinal;
 begin
   Result := '';
+  // Upgrade of an install whose protection was turned off (`foxhole off` sets manual start): keep it off.
+  WasOff := RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\Foxhole', 'Start', StartType) and (StartType >= 3);
   // Upgrade: stop the service (which restores DNS) and close tray icons so the files can be replaced.
   // Versions before this installer don't know `prepare-upgrade`; `off` does the same for them.
   if FileExists(ExpandConstant('{app}\foxhole.exe')) then
@@ -83,7 +90,10 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
-    Code := RunFoxhole('install-service');
+    if WasOff then
+      Code := RunFoxhole('install-service --off')
+    else
+      Code := RunFoxhole('install-service');
     if Code <> 0 then
       SuppressibleMsgBox('Foxhole was installed, but protection could not be turned on (error ' + IntToStr(Code) + ').'
         + #13#10#13#10 + 'Details are in ' + ExpandConstant('{commonappdata}') + '\Foxhole\foxhole.log.',

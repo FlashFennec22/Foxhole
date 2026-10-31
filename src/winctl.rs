@@ -234,14 +234,15 @@ pub fn run_uninstaller() -> Result<()> {
     Ok(())
 }
 
-/// Installer, after copying files: (re)register the service for this exe and start it.
-pub fn install_service() -> Result<()> {
+/// Installer, after copying files: (re)register the service for this exe and start it,
+/// unless `off` (an upgrade of an install whose protection was turned off).
+pub fn install_service(off: bool) -> Result<()> {
     Config::load_or_create()?; // validates / creates config before we start
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: DISPLAY_NAME.into(),
         service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
+        start_type: if off { ServiceStartType::OnDemand } else { ServiceStartType::AutoStart },
         error_control: ServiceErrorControl::Normal,
         executable_path: std::env::current_exe()?,
         launch_arguments: vec!["service".into()],
@@ -273,8 +274,8 @@ pub fn install_service() -> Result<()> {
         actions: Some(vec![restart(2), restart(5), restart(30)]),
     });
     drop(svc);
-    tracing::info!("service registered");
-    turn_on()
+    tracing::info!(off, "service registered");
+    if off { Ok(()) } else { turn_on() }
 }
 
 /// Installer, before replacing files on an upgrade: stop the service and close the tray icons.
