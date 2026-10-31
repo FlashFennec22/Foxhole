@@ -8,6 +8,8 @@ mod upstream;
 #[cfg(windows)]
 mod service;
 #[cfg(windows)]
+mod trayctl;
+#[cfg(windows)]
 mod winctl;
 
 use anyhow::Result;
@@ -21,6 +23,9 @@ use tokio::sync::Notify;
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
+    /// Internal: set on the copy started through UAC, so it never tries to elevate again.
+    #[arg(long, hide = true, global = true)]
+    elevated: bool,
 }
 
 #[derive(Subcommand)]
@@ -77,7 +82,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Some(Cmd::Run { no_system_dns }) => run_foreground(!no_system_dns),
-        other => windows_cmd(other.unwrap_or(Cmd::On { pause: true, no_tray: false })),
+        other => windows_cmd(other.unwrap_or(Cmd::On { pause: true, no_tray: false }), cli.elevated),
     }
 }
 
@@ -97,22 +102,24 @@ fn run_foreground(manage_dns: bool) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn windows_cmd(_: Cmd) -> Result<()> {
+fn windows_cmd(_: Cmd, _: bool) -> Result<()> {
     anyhow::bail!("this command is only available on Windows (use `run --no-system-dns` to test elsewhere)")
 }
 
 #[cfg(windows)]
-fn windows_cmd(cmd: Cmd) -> Result<()> {
+fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
     use winctl::Status;
 
-    // Returns true if we just handed the job to an elevated copy of ourselves.
-    fn elevate(args: &[&str]) -> Result<bool> {
+    // If we aren't elevated, hands the job to an elevated copy of ourselves and returns its exit code.
+    let elevate = |args: &[&str]| -> Result<Option<u32>> {
         if winctl::is_admin() {
-            return Ok(false);
+            return Ok(None);
         }
-        winctl::relaunch_elevated(args)?;
-        Ok(true)
-    }
+        if elevated {
+            anyhow::bail!("this needs administrator rights, but the elevated copy didn't get them");
+        }
+        winctl::relaunch_elevated(args).map(Some)
+    };
     fn pause() {
         println!("\nPress Enter to close...");
         let mut s = String::new();
@@ -124,9 +131,9 @@ fn windows_cmd(cmd: Cmd) -> Result<()> {
             // The elevated copy skips the tray; we launch it afterwards un-elevated, as the user.
             let mut args = vec!["on", "--no-tray"];
             if p { args.push("--pause"); }
-            if elevate(&args)? {
-                winctl::launch_tray();
-                return Ok(());
+            if let Some(code) = elevate(&args)? {
+                if code == 0 { winctl::launch_tray(); }
+                std::process::exit(code as i32);
             }
             let r = winctl::turn_on();
             match &r {
@@ -138,7 +145,7 @@ fn windows_cmd(cmd: Cmd) -> Result<()> {
             r
         }
         Cmd::Off => {
-            if elevate(&["off"])? { return Ok(()); }
+            if let Some(code) = elevate(&["off"])? { std::process::exit(code as i32); }
             init_logging(false);
             winctl::turn_off()?;
             println!("Foxhole is OFF. Your original DNS settings were restored.");
@@ -148,7 +155,7 @@ fn windows_cmd(cmd: Cmd) -> Result<()> {
             let mut args = vec!["uninstall"];
             if purge { args.push("--purge"); }
             if p { args.push("--pause"); }
-            if elevate(&args)? { return Ok(()); }
+            if let Some(code) = elevate(&args)? { std::process::exit(code as i32); }
             init_logging(false);
 
             let mut purge = purge;

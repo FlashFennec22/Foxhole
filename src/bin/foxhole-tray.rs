@@ -10,17 +10,22 @@ fn main() {
 }
 
 #[cfg(windows)]
+#[path = "../trayctl.rs"]
+mod trayctl;
+
+#[cfg(windows)]
 fn main() {
     app::run();
 }
 
 #[cfg(windows)]
 mod app {
+    use crate::trayctl;
     use serde::Deserialize;
     use std::{
         ffi::OsString,
         fs::OpenOptions,
-        os::windows::{fs::OpenOptionsExt, process::CommandExt},
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
         path::PathBuf,
         process::Command,
         thread,
@@ -38,10 +43,11 @@ mod app {
         service::{ServiceAccess, ServiceState},
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE, SYNCHRONIZATION_SYNCHRONIZE};
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
     const SERVICE_NAME: &str = "Foxhole";
-    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
     #[derive(Clone, Copy, PartialEq)]
     enum SvcState {
@@ -68,6 +74,8 @@ mod app {
         Menu(MenuEvent),
         Status(Snapshot),
         Error(String),
+        /// The installer asked every tray icon to exit.
+        Quit,
     }
 
     // ---------- service / data helpers ----------
@@ -145,28 +153,23 @@ mod app {
         });
     }
 
-    // ---------- autostart (HKCU Run key via reg.exe) ----------
+    // ---------- autostart (HKCU Run key) ----------
 
     fn autostart_enabled() -> bool {
-        Command::new("reg")
-            .args(["query", RUN_KEY, "/v", "Foxhole"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(RUN_KEY)
+            .and_then(|k| k.get_value::<String, _>("Foxhole"))
+            .is_ok()
     }
 
     fn set_autostart(on: bool) {
-        let mut cmd = Command::new("reg");
+        let Ok((key, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(RUN_KEY) else { return };
         if on {
             let Ok(exe) = std::env::current_exe() else { return };
-            cmd.args(["add", RUN_KEY, "/v", "Foxhole", "/t", "REG_SZ", "/d"])
-                .arg(format!("\"{}\"", exe.display()))
-                .arg("/f");
+            let _ = key.set_value("Foxhole", &format!("\"{}\"", exe.display()));
         } else {
-            cmd.args(["delete", RUN_KEY, "/v", "Foxhole", "/f"]);
+            let _ = key.delete_value("Foxhole");
         }
-        let _ = cmd.creation_flags(CREATE_NO_WINDOW).output();
     }
 
     // ---------- UI helpers ----------
@@ -251,12 +254,24 @@ mod app {
         let autostart_id = autostart_item.id().clone();
         let quit_id = quit_item.id().clone();
 
-        let tray = TrayIconBuilder::new()
+        let mut tray = Some(TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Foxhole")
             .with_icon(make_icon([128, 128, 128], false))
             .build()
-            .expect("creating tray icon");
+            .expect("creating tray icon"));
+
+        // Exit when the installer/uninstaller asks (it needs to replace or delete this exe).
+        match trayctl::exit_event(SYNCHRONIZATION_SYNCHRONIZE) {
+            Ok(ev) => {
+                let p = proxy.clone();
+                thread::spawn(move || {
+                    unsafe { WaitForSingleObject(ev.as_raw_handle(), INFINITE) };
+                    let _ = p.send_event(UserEvent::Quit);
+                });
+            }
+            Err(e) => eprintln!("cannot listen for the exit signal: {e}"),
+        }
 
         // Poll the service every 3 s; only notify the UI when something changed.
         {
@@ -279,11 +294,14 @@ mod app {
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
             let Event::UserEvent(ev) = event else { return };
+            // Dropping the TrayIcon removes it from the notification area right away.
+            let Some(icon) = tray.as_ref() else { return };
 
             match ev {
                 UserEvent::Status(snap) => {
                     current = snap.state;
-                    let (icon, tip, status, toggle, enabled) = match snap.state {
+                    let tray_icon = icon;
+                    let (img, tip, status, toggle, enabled) = match snap.state {
                         SvcState::Running => {
                             let text = match &snap.stats {
                                 Some(s) if s.total > 0 => format!(
@@ -318,8 +336,8 @@ mod app {
                             false,
                         ),
                     };
-                    let _ = tray.set_icon(Some(icon));
-                    let _ = tray.set_tooltip(Some(tip));
+                    let _ = tray_icon.set_icon(Some(img));
+                    let _ = tray_icon.set_tooltip(Some(tip));
                     status_item.set_text(status);
                     rules_item.set_text(match &snap.stats {
                         Some(s) => format!("{} rules loaded", fmt_num(s.rules)),
@@ -327,6 +345,10 @@ mod app {
                     });
                     toggle_item.set_text(toggle);
                     toggle_item.set_enabled(enabled);
+                }
+                UserEvent::Quit => {
+                    tray = None;
+                    *control_flow = ControlFlow::Exit;
                 }
                 UserEvent::Error(msg) => {
                     status_item.set_text(format!("Couldn't change protection: {msg}"));
@@ -346,6 +368,7 @@ mod app {
                     } else if me.id == autostart_id {
                         set_autostart(autostart_item.is_checked());
                     } else if me.id == quit_id {
+                        tray = None;
                         *control_flow = ControlFlow::Exit;
                     }
                 }
