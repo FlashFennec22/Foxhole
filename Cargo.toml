@@ -27,7 +27,13 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_UI_Shell",
+] }
 # tray app (src/bin/foxhole-tray.rs); tray-icon 0.19 pairs with tao 0.30
 tray-icon = "0.19"
 tao = "0.30"

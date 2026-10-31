@@ -37,23 +37,33 @@ pub async fn run(cfg: Config, shutdown: Arc<Notify>, manage_dns: bool) -> Result
     tokio::spawn(updater(cfg.clone(), state.clone()));
     tokio::spawn(stats_writer(state.clone()));
 
-    // Every minute (and immediately): make sure all active adapters point at us,
-    // which also covers Wi-Fi switches, VPNs and newly attached adapters.
-    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    // Make sure all active adapters point at us: immediately, whenever Windows reports an
+    // interface/address change (Wi-Fi switch, VPN, new adapter, DHCP), and every few minutes as a
+    // safety net in case something rewrites the settings without a network change.
+    let watcher = if manage_dns {
+        sysdns::Watcher::new().map_err(|e| warn!(error = %e, "cannot watch network changes; polling only")).ok()
+    } else {
+        None
+    };
+    let mut tick = tokio::time::interval(Duration::from_secs(if watcher.is_some() { 300 } else { 60 }));
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
-            _ = tick.tick() => {
-                if manage_dns {
-                    match tokio::task::spawn_blocking(move || sysdns::apply(ipv6)).await {
-                        Ok(Err(e)) => warn!(error = %e, "failed to apply system DNS settings"),
-                        Err(e) => warn!(error = %e, "DNS task panicked"),
-                        _ => {}
-                    }
-                }
+            _ = tick.tick() => {}
+            _ = async { match &watcher { Some(w) => w.changed().await, None => std::future::pending().await } } => {
+                // Changes arrive in bursts (link up, DHCP, IPv6 autoconfiguration): let them settle.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        if manage_dns {
+            match tokio::task::spawn_blocking(move || sysdns::apply(ipv6)).await {
+                Ok(Err(e)) => warn!(error = %e, "failed to apply system DNS settings"),
+                Err(e) => warn!(error = %e, "DNS task panicked"),
+                _ => {}
             }
         }
     }
+    drop(watcher);
 
     info!(total = state.total.load(Relaxed), blocked = state.blocked.load(Relaxed), "shutting down");
     if manage_dns {
