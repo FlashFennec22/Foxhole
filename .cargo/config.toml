@@ -1,0 +1,7 @@
+# Link the MSVC C runtime statically. Without this, foxhole.exe imports VCRUNTIME140.dll,
+# which is not part of Windows, so it fails to start on PCs without the VC++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

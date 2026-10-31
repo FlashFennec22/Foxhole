@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "foxhole-tray"
 path = "src/bin/foxhole-tray.rs"
 
+[build-dependencies]
+# Embeds the version info, icon and application manifest (build.rs; Windows targets only).
+embed-resource = "3"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -27,7 +31,21 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+winreg = "0.55"
 # tray app (src/bin/foxhole-tray.rs); tray-icon 0.19 pairs with tao 0.30
 tray-icon = "0.19"
 tao = "0.30"

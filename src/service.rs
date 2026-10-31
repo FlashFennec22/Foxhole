@@ -30,13 +30,15 @@ fn status(handle: &ServiceStatusHandle, state: ServiceState, code: u32) {
     } else {
         ServiceControlAccept::empty()
     };
+    // Loading the cached blocklists can take a moment on slow disks.
+    let wait_hint = if state == ServiceState::StartPending { Duration::from_secs(30) } else { Duration::default() };
     let _ = handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
         controls_accepted: accept,
         exit_code: ServiceExitCode::Win32(code),
         checkpoint: 0,
-        wait_hint: Duration::default(),
+        wait_hint,
         process_id: None,
     });
 }
@@ -53,12 +55,14 @@ fn run_service() -> anyhow::Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     })?;
 
-    status(&handle, ServiceState::Running, 0);
+    // Report RUNNING only once port 53 is bound, so `foxhole on` and the installer can tell
+    // whether protection really started (e.g. not when another DNS server holds the port).
+    status(&handle, ServiceState::StartPending, 0);
 
     let result = (|| -> anyhow::Result<()> {
         let cfg = Config::load_or_create()?;
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        rt.block_on(engine::run(cfg, shutdown, true))
+        rt.block_on(engine::run(cfg, shutdown, true, || status(&handle, ServiceState::Running, 0)))
     })();
 
     if let Err(e) = &result {

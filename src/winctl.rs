@@ -1,60 +1,115 @@
-//! Install / start / stop / uninstall the Windows service by driving `sc.exe`,
-//! plus UAC self-elevation.
+//! Service registration and control through the Service Control Manager API, plus UAC
+//! self-elevation. Copying files, the Installed-apps entry and removal are the installer's job
+//! (installer/foxhole.iss); it calls the hidden `install-service`, `prepare-upgrade` and
+//! `uninstall-service` commands below.
 
-use crate::{config::{data_dir, Config}, service::SERVICE_NAME, sysdns};
+use crate::{config::Config, service::SERVICE_NAME, sysdns, trayctl};
 use anyhow::{bail, Context, Result};
-use std::{os::windows::process::CommandExt, path::{Path, PathBuf}, process::Command, time::{Duration, Instant}};
+use std::{
+    ffi::OsString,
+    io,
+    mem::size_of,
+    os::windows::{ffi::OsStrExt, io::{AsRawHandle, FromRawHandle, OwnedHandle}},
+    path::{Path, PathBuf},
+    ptr,
+    time::{Duration, Instant},
+};
+use windows_service::{
+    service::{
+        Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
+        ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
+    },
+    service_manager::{ServiceManager, ServiceManagerAccess},
+};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, LocalFree, ERROR_CANCELLED, INVALID_HANDLE_VALUE},
+    Security::{
+        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    },
+    System::{
+        Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS},
+        Services::{ChangeServiceConfigW, SetServiceObjectSecurity, SERVICE_AUTO_START, SERVICE_DEMAND_START, SERVICE_NO_CHANGE},
+        Threading::{
+            GetExitCodeProcess, ResetEvent, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
+            SYNCHRONIZATION_SYNCHRONIZE,
+        },
+    },
+    UI::{
+        Shell::{IsUserAnAdmin, ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
+        WindowsAndMessaging::SW_SHOWNORMAL,
+    },
+};
+use winreg::{enums::{HKEY_CURRENT_USER, KEY_SET_VALUE}, RegKey};
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DISPLAY_NAME: &str = "Foxhole DNS Ad Blocker";
 const TRAY_EXE: &str = "foxhole-tray.exe";
-const UNINSTALL_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Foxhole";
+/// Inno Setup's uninstaller, next to the installed exes.
+const UNINSTALLER_EXE: &str = "unins000.exe";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// Service ACL: SYSTEM + Administrators keep full control; interactive users may query,
 /// START and STOP the service (so the tray can toggle without UAC) but NOT change its config.
 const SERVICE_SDDL: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
 
 pub fn is_admin() -> bool {
-    unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+    unsafe { IsUserAnAdmin() != 0 }
 }
 
-/// Re-launch this exe through UAC with the given args and wait for it to finish.
-pub fn relaunch_elevated(args: &[&str]) -> Result<()> {
-    println!("Requesting administrator permission...");
-    let exe = std::env::current_exe()?.display().to_string().replace('\'', "''");
-    let arglist = if args.is_empty() {
-        String::new()
-    } else {
-        format!(" -ArgumentList {}", args.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(","))
-    };
-    let status = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", &format!("Start-Process -FilePath '{exe}' -Verb RunAs -Wait{arglist}")])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .context("failed to request administrator rights")?;
-    if !status.success() {
-        bail!("administrator permission was not granted");
+/// ShellExecuteEx, i.e. start a program the way Explorer would. Unlike `std::process::Command`, this
+/// doesn't let the child inherit our handles, so a caller reading our output through a pipe isn't
+/// kept waiting by a long-running child such as the tray icon.
+fn shell_execute(verb: &str, file: &Path, params: &str) -> io::Result<Option<OwnedHandle>> {
+    let file: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+    let params = trayctl::wide(params);
+    let verb = trayctl::wide(verb);
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.nShow = SW_SHOWNORMAL;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok((!info.hProcess.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(info.hProcess) }))
 }
 
-fn sc(args: &[&str]) -> Result<(bool, String)> {
-    let out = Command::new("sc.exe").args(args).creation_flags(CREATE_NO_WINDOW).output().context("running sc.exe")?;
-    Ok((out.status.success(), String::from_utf8_lossy(&out.stdout).to_string()))
+/// Re-launches this exe through UAC with the given args, waits for it and returns its exit code.
+pub fn relaunch_elevated(args: &[&str]) -> Result<u32> {
+    println!("Requesting administrator permission...");
+    // `--elevated` lets the copy detect that elevation didn't actually happen, instead of looping.
+    let params = args.iter().copied().chain(["--elevated"]).collect::<Vec<_>>().join(" "); // space-free literals
+    let process = match shell_execute("runas", &std::env::current_exe()?, &params) {
+        Ok(Some(p)) => p,
+        Ok(None) => bail!("could not start Foxhole as administrator"),
+        Err(e) if e.raw_os_error() == Some(ERROR_CANCELLED as i32) => bail!("administrator permission was not granted"),
+        Err(e) => return Err(e).context("could not start Foxhole as administrator"),
+    };
+    let mut code = 1;
+    unsafe {
+        WaitForSingleObject(process.as_raw_handle(), INFINITE);
+        GetExitCodeProcess(process.as_raw_handle(), &mut code);
+    }
+    Ok(code)
 }
 
-fn exists() -> bool {
-    sc(&["query", SERVICE_NAME]).map(|(ok, _)| ok).unwrap_or(false)
+fn open(access: ServiceAccess) -> Option<Service> {
+    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+    mgr.open_service(SERVICE_NAME, access).ok()
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Status { NotInstalled, Running, Stopped, Other }
 
 pub fn status() -> Status {
-    match sc(&["query", SERVICE_NAME]) {
-        Ok((true, out)) if out.contains("RUNNING") => Status::Running,
-        Ok((true, out)) if out.contains("STOPPED") => Status::Stopped,
-        Ok((true, _)) => Status::Other,
-        _ => Status::NotInstalled,
+    let Some(svc) = open(ServiceAccess::QUERY_STATUS) else { return Status::NotInstalled };
+    match svc.query_status().map(|s| s.current_state) {
+        Ok(ServiceState::Running) => Status::Running,
+        Ok(ServiceState::Stopped) => Status::Stopped,
+        Ok(_) => Status::Other,
+        Err(_) => Status::NotInstalled,
     }
 }
 
@@ -67,158 +122,223 @@ fn wait_for(target: Status, secs: u64) -> bool {
     status() == target
 }
 
-fn stop() {
-    if exists() && status() != Status::Stopped {
-        let _ = sc(&["stop", SERVICE_NAME]);
-        wait_for(Status::Stopped, 15);
+/// Waits (up to `secs`) for a start or stop in progress to finish, and returns the outcome.
+fn wait_settled(secs: u64) -> Status {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let s = status();
+        if s != Status::Other || Instant::now() >= deadline {
+            return s;
+        }
+        std::thread::sleep(Duration::from_millis(300));
     }
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
-    a.display().to_string().eq_ignore_ascii_case(&b.display().to_string())
+/// Stops the service if it is running. Returns false if it is still running afterwards.
+fn stop() -> bool {
+    if let Some(svc) = open(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS) {
+        if wait_settled(15) != Status::Stopped {
+            let _ = svc.stop();
+            return wait_for(Status::Stopped, 15);
+        }
+    }
+    true
 }
 
-fn kill_tray() {
-    let _ = Command::new("taskkill").args(["/IM", TRAY_EXE, "/F"]).creation_flags(CREATE_NO_WINDOW).output();
+/// Switches between automatic start (protection on at boot) and manual start (stays off).
+fn set_auto_start(svc: &Service, auto: bool) -> Result<()> {
+    let start = if auto { SERVICE_AUTO_START } else { SERVICE_DEMAND_START };
+    let ok = unsafe {
+        ChangeServiceConfigW(
+            svc.raw_handle() as _, SERVICE_NO_CHANGE, start, SERVICE_NO_CHANGE,
+            ptr::null(), ptr::null(), ptr::null_mut(), ptr::null(), ptr::null(), ptr::null(), ptr::null(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error()).context("changing the service start type");
+    }
+    Ok(())
+}
+
+fn set_security(svc: &Service, sddl: &str) -> io::Result<()> {
+    let sddl = trayctl::wide(sddl);
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, ptr::null_mut()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let ok = unsafe { SetServiceObjectSecurity(svc.raw_handle() as _, DACL_SECURITY_INFORMATION, sd) };
+    let err = io::Error::last_os_error();
+    unsafe { LocalFree(sd) };
+    if ok == 0 { Err(err) } else { Ok(()) }
+}
+
+fn tray_running() -> bool {
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut e: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut found = false;
+    let mut more = unsafe { Process32FirstW(snap, &mut e) } != 0;
+    while more && !found {
+        let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+        found = String::from_utf16_lossy(&e.szExeFile[..len]).eq_ignore_ascii_case(TRAY_EXE);
+        more = unsafe { Process32NextW(snap, &mut e) } != 0;
+    }
+    unsafe { CloseHandle(snap) };
+    found
+}
+
+/// Asks every running tray icon (any user, any session) to exit, and waits up to 5 s for them.
+/// Returns false if one is still running (e.g. an old version that doesn't listen for the signal).
+pub fn close_trays() -> bool {
+    if !tray_running() {
+        return true;
+    }
+    let ev = match trayctl::exit_event(EVENT_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE) {
+        Ok(ev) => ev,
+        Err(e) => { tracing::warn!(error = %e, "cannot signal the tray icon"); return false; }
+    };
+    unsafe { SetEvent(ev.as_raw_handle()) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tray_running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Reset so a tray started later (e.g. right after an upgrade) doesn't exit immediately.
+    unsafe { ResetEvent(ev.as_raw_handle()) };
+    !tray_running()
+}
+
+/// The folder holding the installed exes (wherever the installer put them).
+fn exe_dir() -> Result<PathBuf> {
+    Ok(std::env::current_exe()?.parent().context("exe has no parent folder")?.to_path_buf())
 }
 
 /// Start the tray app (best effort). Call from a NON-elevated process so it runs as the user.
 pub fn launch_tray() {
-    let p = install_dir().join(TRAY_EXE);
-    if p.exists() {
-        let _ = Command::new(p).spawn();
-    }
-}
-
-
-/// Adds the entry shown in Settings -> Apps -> Installed apps.
-fn register_uninstall(exe: &Path) {
-    let exe_s = exe.display().to_string();
-    let dir_s = install_dir().display().to_string();
-    let uninstall_cmd = format!("\"{exe_s}\" uninstall --pause");
-    let values: [(&str, &str, &str); 8] = [
-        ("DisplayName", "REG_SZ", "Foxhole DNS Ad Blocker"),
-        ("DisplayVersion", "REG_SZ", env!("CARGO_PKG_VERSION")),
-        ("Publisher", "REG_SZ", "Foxhole"),
-        ("InstallLocation", "REG_SZ", dir_s.as_str()),
-        ("DisplayIcon", "REG_SZ", exe_s.as_str()),
-        ("UninstallString", "REG_SZ", uninstall_cmd.as_str()),
-        ("NoModify", "REG_DWORD", "1"),
-        ("NoRepair", "REG_DWORD", "1"),
-    ];
-    for (name, kind, value) in values {
-        let _ = Command::new("reg")
-            .args(["add", UNINSTALL_KEY, "/v", name, "/t", kind, "/d", value, "/f"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-    }
-}
-
-fn reg_delete(key: &str, value: Option<&str>) {
-    let mut cmd = Command::new("reg");
-    cmd.args(["delete", key]);
-    match value {
-        Some(v) => { cmd.args(["/v", v]); }
-        None => { cmd.arg("/va"); }
-    }
-    let _ = cmd.arg("/f").creation_flags(CREATE_NO_WINDOW).output();
-}
-
-fn install_dir() -> PathBuf {
-    std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files")).join("Foxhole")
-}
-
-/// Copy the exe to Program Files and (re)register the service with auto-start + auto-restart.
-fn install() -> Result<()> {
-    let dir = install_dir();
-    let target = dir.join("foxhole.exe");
-    let current = std::env::current_exe()?;
-    stop();
-    kill_tray(); // its exe can't be overwritten while running
-    if !same_path(&current, &target) {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::copy(&current, &target).with_context(|| format!("copying to {}", target.display()))?;
-    }
-    if let Some(src_dir) = current.parent() {
-        let (src, dst) = (src_dir.join(TRAY_EXE), dir.join(TRAY_EXE));
-        if src.exists() && !same_path(&src, &dst) {
-            std::fs::copy(&src, &dst).with_context(|| format!("copying to {}", dst.display()))?;
+    if let Ok(p) = exe_dir().map(|d| d.join(TRAY_EXE)) {
+        if p.exists() {
+            let _ = shell_execute("open", &p, "");
         }
     }
-    let bin = format!("\"{}\" service", target.display());
-    let (ok, out) = if exists() {
-        sc(&["config", SERVICE_NAME, "binPath=", &bin, "start=", "auto"])?
-    } else {
-        sc(&["create", SERVICE_NAME, "binPath=", &bin, "start=", "auto", "DisplayName=", "Foxhole DNS Ad Blocker"])?
-    };
-    if !ok { bail!("sc.exe failed: {}", out.trim()); }
-    match sc(&["sdset", SERVICE_NAME, SERVICE_SDDL]) {
-        Ok((true, _)) => {}
-        _ => println!("Warning: could not set service permissions; the tray icon may need admin rights to toggle."),
+}
+
+/// Opens the uninstaller (it asks for administrator rights itself).
+pub fn run_uninstaller() -> Result<()> {
+    let p = exe_dir()?.join(UNINSTALLER_EXE);
+    if !p.exists() {
+        bail!("uninstaller not found; remove Foxhole from Settings > Apps > Installed apps instead");
     }
-    let _ = sc(&["description", SERVICE_NAME, "Local DNS resolver that blocks ads and trackers."]);
-    // If the process ever dies, restart it quickly so DNS never stays pointed at a dead resolver.
-    let _ = sc(&["failure", SERVICE_NAME, "reset=", "86400", "actions=", "restart/2000/restart/5000/restart/30000"]);
-    register_uninstall(&target);
+    shell_execute("open", &p, "").context("starting the uninstaller")?;
     Ok(())
 }
 
-pub fn turn_on() -> Result<()> {
+/// Installer, after copying files: (re)register the service for this exe and start it,
+/// unless `off` (an upgrade of an install whose protection was turned off).
+pub fn install_service(off: bool) -> Result<()> {
     Config::load_or_create()?; // validates / creates config before we start
-    println!("Installing service...");
-    install()?;
-    println!("Starting...");
-    let (_, out) = sc(&["start", SERVICE_NAME])?;
-    if !wait_for(Status::Running, 10) {
-        bail!("service did not start. See %ProgramData%\\Foxhole\\foxhole.log\n{}", out.trim());
+    let info = ServiceInfo {
+        name: SERVICE_NAME.into(),
+        display_name: DISPLAY_NAME.into(),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: if off { ServiceStartType::OnDemand } else { ServiceStartType::AutoStart },
+        error_control: ServiceErrorControl::Normal,
+        executable_path: std::env::current_exe()?,
+        launch_arguments: vec!["service".into()],
+        dependencies: vec![],
+        account_name: None, // LocalSystem
+        account_password: None,
+    };
+    // ALL_ACCESS because setting the service's DACL needs WRITE_DAC, which ServiceAccess doesn't name.
+    let access = ServiceAccess::ALL_ACCESS;
+    let svc = match open(access) {
+        Some(svc) => {
+            svc.change_config(&info).context("updating the service")?;
+            svc
+        }
+        None => ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)
+            .and_then(|m| m.create_service(&info, access))
+            .context("creating the service")?,
+    };
+    if let Err(e) = set_security(&svc, SERVICE_SDDL) {
+        tracing::warn!(error = %e, "could not set service permissions; the tray icon may need admin rights to toggle");
+    }
+    let _ = svc.set_description("Local DNS resolver that blocks ads and trackers.");
+    // If the process ever dies, restart it quickly so DNS never stays pointed at a dead resolver.
+    let restart = |secs| ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(secs) };
+    let _ = svc.update_failure_actions(ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86400)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![restart(2), restart(5), restart(30)]),
+    });
+    drop(svc);
+    tracing::info!(off, "service registered");
+    if off { Ok(()) } else { turn_on() }
+}
+
+/// Installer, before replacing files on an upgrade: stop the service and close the tray icons.
+pub fn prepare_upgrade() -> Result<()> {
+    // Trays first, so none can restart the service in between.
+    if !close_trays() {
+        tracing::warn!("a tray icon is still running");
+    }
+    if !stop() {
+        bail!("the Foxhole service didn't stop"); // the service restores DNS as it stops
     }
     Ok(())
 }
 
-pub fn turn_off() -> Result<()> {
-    if exists() {
-        let _ = sc(&["config", SERVICE_NAME, "start=", "demand"]); // stay off across reboots
-        stop();
+/// Uninstaller, before deleting files: stop, restore DNS, remove the service and autostart entry.
+pub fn uninstall_service() -> Result<()> {
+    // Trays first, so none can restart the service while it is being removed.
+    close_trays();
+    if let Err(e) = turn_off() {
+        tracing::warn!(error = %format!("{e:#}"), "problem turning protection off; removing the service anyway");
     }
-    sysdns::restore()?; // idempotent safety net in case the service died uncleanly
-    Ok(())
-}
-
-/// Full removal: stop, restore DNS, delete the service and registry entries.
-/// `purge` also deletes settings, cached lists and logs in %ProgramData%\Foxhole.
-/// Program Files is removed afterwards by `remove_install_dir()`, once this process is done.
-pub fn uninstall(purge: bool) -> Result<()> {
-    println!("Stopping protection and restoring your DNS settings...");
-    turn_off()?;
-
-    println!("Removing service...");
-    kill_tray();
-    reg_delete(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", Some("Foxhole"));
-    if exists() {
-        let _ = sc(&["delete", SERVICE_NAME]);
+    if let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
+        let _ = run.delete_value("Foxhole");
+    }
+    if let Some(svc) = open(ServiceAccess::DELETE) {
+        svc.delete().context("deleting the service")?;
+        drop(svc); // the service disappears once the last handle is closed
         let deadline = Instant::now() + Duration::from_secs(5);
-        while exists() && Instant::now() < deadline {
+        while status() != Status::NotInstalled && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(300));
         }
     }
-    reg_delete(UNINSTALL_KEY, None);
+    tracing::info!("service removed");
+    Ok(())
+}
 
-    if purge {
-        println!("Deleting settings, cached lists and logs...");
-        let _ = std::fs::remove_dir_all(data_dir());
+/// Enables autostart and (re)starts the service, so edits to config.toml take effect.
+pub fn turn_on() -> Result<()> {
+    let Some(svc) = open(ServiceAccess::CHANGE_CONFIG | ServiceAccess::START) else {
+        bail!("Foxhole isn't installed. Run the Foxhole installer (Foxhole-Setup-*.exe) first.");
+    };
+    set_auto_start(&svc, true)?;
+    if !stop() {
+        bail!("the Foxhole service didn't stop; try again in a moment");
+    }
+    let started = svc.start::<OsString>(&[]);
+    // The service reports RUNNING only once it is listening on port 53, and stops if it can't.
+    if wait_settled(30) != Status::Running {
+        let why = started.err().map(|e| format!("\n{e}")).unwrap_or_default();
+        bail!("service did not start. See %ProgramData%\\Foxhole\\foxhole.log{why}");
     }
     Ok(())
 }
 
-/// Deletes C:\Program Files\Foxhole shortly after this process exits (a running exe can't delete itself).
-pub fn remove_install_dir() {
-    let dir = install_dir();
-    // Safety: never run a recursive delete on anything that isn't our own folder.
-    if dir.file_name().map_or(true, |n| !n.eq_ignore_ascii_case("Foxhole")) {
-        return;
+/// Best effort: even if one step fails, the others (above all restoring DNS) still run.
+pub fn turn_off() -> Result<()> {
+    let mut result = Ok(());
+    if let Some(svc) = open(ServiceAccess::CHANGE_CONFIG) {
+        result = set_auto_start(&svc, false); // stay off across reboots
+        if !stop() {
+            result = result.and(Err(anyhow::anyhow!("the Foxhole service didn't stop")));
+        }
     }
-    let _ = Command::new("cmd.exe")
-        .raw_arg(format!("/C ping -n 4 127.0.0.1 >nul & rmdir /S /Q \"{}\"", dir.display()))
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+    let restored = sysdns::restore(); // idempotent safety net in case the service died uncleanly
+    result.and(restored)
 }

@@ -8,6 +8,8 @@ mod upstream;
 #[cfg(windows)]
 mod service;
 #[cfg(windows)]
+mod trayctl;
+#[cfg(windows)]
 mod winctl;
 
 use anyhow::Result;
@@ -21,11 +23,14 @@ use tokio::sync::Notify;
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
+    /// Internal: set on the copy started through UAC, so it never tries to elevate again.
+    #[arg(long, hide = true, global = true)]
+    elevated: bool,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Install (if needed) and turn protection on. This is also what double-clicking does.
+    /// Turn protection on (and restart it, to apply config changes). This is also what double-clicking does.
     On {
         #[arg(long, hide = true)]
         pause: bool,
@@ -36,14 +41,8 @@ enum Cmd {
     Off,
     /// Show whether protection is running
     Status,
-    /// Remove Foxhole completely and restore DNS settings
-    Uninstall {
-        /// Also delete settings, cached blocklists and logs
-        #[arg(long)]
-        purge: bool,
-        #[arg(long, hide = true)]
-        pause: bool,
-    },
+    /// Open the uninstaller (restores your DNS settings and removes Foxhole)
+    Uninstall,
     /// Run in the foreground for debugging (Ctrl+C to stop)
     Run {
         /// Don't touch Windows' DNS settings; just listen on 127.0.0.1:53
@@ -53,6 +52,19 @@ enum Cmd {
     /// Internal: entry point used by the Windows Service Control Manager
     #[command(hide = true)]
     Service,
+    /// Internal (installer): register the service for this exe and start it
+    #[command(hide = true)]
+    InstallService {
+        /// Register it with protection off (manual start), e.g. when upgrading an install that was off
+        #[arg(long)]
+        off: bool,
+    },
+    /// Internal (installer): stop the service and tray icons before an upgrade replaces the files
+    #[command(hide = true)]
+    PrepareUpgrade,
+    /// Internal (uninstaller): restore DNS and remove the service
+    #[command(hide = true)]
+    UninstallService,
 }
 
 fn init_logging(to_file: bool) {
@@ -77,7 +89,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Some(Cmd::Run { no_system_dns }) => run_foreground(!no_system_dns),
-        other => windows_cmd(other.unwrap_or(Cmd::On { pause: true, no_tray: false })),
+        other => windows_cmd(other.unwrap_or(Cmd::On { pause: true, no_tray: false }), cli.elevated),
     }
 }
 
@@ -92,27 +104,29 @@ fn run_foreground(manage_dns: bool) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             s2.notify_one();
         });
-        engine::run(cfg, shutdown, manage_dns).await
+        engine::run(cfg, shutdown, manage_dns, || {}).await
     })
 }
 
 #[cfg(not(windows))]
-fn windows_cmd(_: Cmd) -> Result<()> {
+fn windows_cmd(_: Cmd, _: bool) -> Result<()> {
     anyhow::bail!("this command is only available on Windows (use `run --no-system-dns` to test elsewhere)")
 }
 
 #[cfg(windows)]
-fn windows_cmd(cmd: Cmd) -> Result<()> {
+fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
     use winctl::Status;
 
-    // Returns true if we just handed the job to an elevated copy of ourselves.
-    fn elevate(args: &[&str]) -> Result<bool> {
+    // If we aren't elevated, hands the job to an elevated copy of ourselves and returns its exit code.
+    let elevate = |args: &[&str]| -> Result<Option<u32>> {
         if winctl::is_admin() {
-            return Ok(false);
+            return Ok(None);
         }
-        winctl::relaunch_elevated(args)?;
-        Ok(true)
-    }
+        if elevated {
+            anyhow::bail!("this needs administrator rights, but the elevated copy didn't get them");
+        }
+        winctl::relaunch_elevated(args).map(Some)
+    };
     fn pause() {
         println!("\nPress Enter to close...");
         let mut s = String::new();
@@ -124,9 +138,9 @@ fn windows_cmd(cmd: Cmd) -> Result<()> {
             // The elevated copy skips the tray; we launch it afterwards un-elevated, as the user.
             let mut args = vec!["on", "--no-tray"];
             if p { args.push("--pause"); }
-            if elevate(&args)? {
-                winctl::launch_tray();
-                return Ok(());
+            if let Some(code) = elevate(&args)? {
+                if code == 0 { winctl::launch_tray(); }
+                std::process::exit(code as i32);
             }
             let r = winctl::turn_on();
             match &r {
@@ -135,40 +149,18 @@ fn windows_cmd(cmd: Cmd) -> Result<()> {
             }
             if r.is_ok() && !no_tray { winctl::launch_tray(); }
             if p { pause(); }
-            r
+            // The error was already shown above; just report it through the exit code.
+            if r.is_err() { std::process::exit(1); }
+            Ok(())
         }
         Cmd::Off => {
-            if elevate(&["off"])? { return Ok(()); }
+            if let Some(code) = elevate(&["off"])? { std::process::exit(code as i32); }
             init_logging(false);
             winctl::turn_off()?;
             println!("Foxhole is OFF. Your original DNS settings were restored.");
             Ok(())
         }
-        Cmd::Uninstall { purge, pause: p } => {
-            let mut args = vec!["uninstall"];
-            if purge { args.push("--purge"); }
-            if p { args.push("--pause"); }
-            if elevate(&args)? { return Ok(()); }
-            init_logging(false);
-
-            let mut purge = purge;
-            if p && !purge {
-                print!("Also delete your settings, cached blocklists and logs? [y/N] ");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                let mut line = String::new();
-                let _ = std::io::stdin().read_line(&mut line);
-                purge = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-            }
-
-            let r = winctl::uninstall(purge);
-            match &r {
-                Ok(()) => println!("\nFoxhole was removed and your DNS settings were restored."),
-                Err(e) => println!("\nUninstall problem: {e:#}"),
-            }
-            if p { pause(); }
-            if r.is_ok() { winctl::remove_install_dir(); }
-            r
-        }
+        Cmd::Uninstall => winctl::run_uninstaller(),
         Cmd::Status => {
             println!("{}", match winctl::status() {
                 Status::Running => "ON (service running)",
@@ -181,6 +173,22 @@ fn windows_cmd(cmd: Cmd) -> Result<()> {
         Cmd::Service => {
             init_logging(true);
             service::dispatch().map_err(Into::into)
+        }
+        // Run by the (already elevated) installer with no console; details go to foxhole.log.
+        Cmd::InstallService { .. } | Cmd::PrepareUpgrade | Cmd::UninstallService => {
+            init_logging(true);
+            if !winctl::is_admin() {
+                anyhow::bail!("this command is for the installer and needs administrator rights");
+            }
+            let r = match cmd {
+                Cmd::InstallService { off } => winctl::install_service(off),
+                Cmd::PrepareUpgrade => winctl::prepare_upgrade(),
+                _ => winctl::uninstall_service(),
+            };
+            if let Err(e) = &r {
+                tracing::error!(error = %format!("{e:#}"), "installer step failed");
+            }
+            r
         }
         Cmd::Run { .. } => unreachable!(),
     }
