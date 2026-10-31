@@ -34,7 +34,7 @@ mod win {
     use windows_sys::{
         core::GUID,
         Win32::{
-            Foundation::{ERROR_BUFFER_OVERFLOW, HANDLE, NO_ERROR},
+            Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, HANDLE, NO_ERROR},
             NetworkManagement::{
                 IpHelper::{
                     CancelMibChangeNotify2, FreeInterfaceDnsSettings, GetAdaptersAddresses, GetInterfaceDnsSettings,
@@ -47,6 +47,7 @@ mod win {
                 Ndis::IfOperStatusUp,
             },
             Networking::WinSock::AF_UNSPEC,
+            System::Registry::{RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_SZ},
         },
     };
 
@@ -67,8 +68,10 @@ mod win {
         guid: String,
         index: u32,
         name: String,
-        /// Static IPv4 DNS servers the adapter had before. Empty = it used DHCP.
-        original: Vec<String>,
+        /// Static IPv4 DNS servers the adapter had before (empty = it used DHCP), if we replaced them
+        /// and haven't restored them yet. None = nothing to restore for IPv4.
+        #[serde(default)]
+        original: Option<Vec<String>>,
         /// Static IPv6 DNS servers before, if we replaced them. None = IPv6 DNS was left alone.
         #[serde(default)]
         original_v6: Option<Vec<String>>,
@@ -90,12 +93,16 @@ mod win {
     }
 
     fn save_state(saved: &[Saved]) -> Result<()> {
+        let path = state_path();
         if saved.is_empty() {
-            let _ = std::fs::remove_file(state_path());
+            let _ = std::fs::remove_file(&path);
             return Ok(());
         }
         std::fs::create_dir_all(data_dir())?;
-        std::fs::write(state_path(), serde_json::to_string_pretty(saved)?).context("writing dns-state.json")
+        // Write-then-rename, so a crash mid-write can't lose the user's original settings.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(saved)?).context("writing dns-state.json")?;
+        std::fs::rename(&tmp, &path).context("writing dns-state.json")
     }
 
     fn parse_guid(s: &str) -> Option<GUID> {
@@ -118,8 +125,9 @@ mod win {
         String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
     }
 
-    /// Adapters that are up, excluding loopback and tunnel pseudo-interfaces.
-    fn adapters() -> Result<Vec<Adapter>> {
+    /// Present adapters (only those that are up, if `up_only`), excluding loopback and tunnel
+    /// pseudo-interfaces.
+    fn adapters(up_only: bool) -> Result<Vec<Adapter>> {
         let flags = GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
         let mut size: u32 = 16 * 1024;
         for _ in 0..4 {
@@ -138,7 +146,7 @@ mod win {
             while !p.is_null() {
                 let a = unsafe { &*p };
                 p = a.Next;
-                if a.OperStatus != IfOperStatusUp || a.IfType == IF_TYPE_SOFTWARE_LOOPBACK || a.IfType == IF_TYPE_TUNNEL {
+                if (up_only && a.OperStatus != IfOperStatusUp) || a.IfType == IF_TYPE_SOFTWARE_LOOPBACK || a.IfType == IF_TYPE_TUNNEL {
                     continue;
                 }
                 let guid_str = unsafe { std::ffi::CStr::from_ptr(a.AdapterName.cast()) }.to_string_lossy().into_owned();
@@ -189,6 +197,31 @@ mod win {
         Ok(())
     }
 
+    /// Fallback for adapters that aren't present (e.g. an undocked laptop's dock NIC), which the
+    /// API can't configure: write the persistent setting that TCP/IP reads when the adapter returns.
+    /// Returns Ok(false) if Windows has no configuration for this interface at all (adapter removed).
+    fn set_static_registry(guid: &str, v6: bool, servers: &[String]) -> Result<bool> {
+        let list: Vec<&str> = servers.iter().map(String::as_str).filter(|s| s.parse::<std::net::IpAddr>().is_ok()).collect();
+        let tcpip = if v6 { "Tcpip6" } else { "Tcpip" };
+        let key = wide(&format!(r"SYSTEM\CurrentControlSet\Services\{tcpip}\Parameters\Interfaces\{guid}"));
+        let value = wide(&list.join(","));
+        let mut h: HKEY = ptr::null_mut();
+        let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.as_ptr(), 0, KEY_SET_VALUE, &mut h) };
+        if rc == ERROR_FILE_NOT_FOUND {
+            return Ok(false);
+        }
+        if rc != NO_ERROR {
+            bail!("opening the interface's TCP/IP settings failed: error {rc}");
+        }
+        let name = wide("NameServer");
+        let rc = unsafe { RegSetValueExW(h, name.as_ptr(), 0, REG_SZ, value.as_ptr().cast(), (value.len() * 2) as u32) };
+        unsafe { RegCloseKey(h) };
+        if rc != NO_ERROR {
+            bail!("writing NameServer failed: error {rc}");
+        }
+        Ok(true)
+    }
+
     fn without(servers: Vec<String>, ours: &str) -> Vec<String> {
         servers.into_iter().filter(|s| s != ours).collect()
     }
@@ -197,19 +230,20 @@ mod win {
         unsafe { DnsFlushResolverCache() };
     }
 
-    /// Idempotent: only touches adapters that don't already point (only) at us.
+    /// Idempotent: only touches adapters that don't already point (only) at us. The two address
+    /// families are handled independently, so a family that can't be read or set (e.g. IPv6 unbound
+    /// on that adapter) doesn't leave the other one unprotected.
     pub fn apply(ipv6: bool) -> Result<()> {
         let mut saved = load_state();
         let mut todo = Vec::new();
-        for a in adapters()? {
-            let current = || -> Result<_> {
-                Ok((get_static(a.guid, false)?, if ipv6 { Some(get_static(a.guid, true)?) } else { None }))
+        for a in adapters(true)? {
+            let read = |v6: bool| match get_static(a.guid, v6) {
+                Ok(v) => Some(v),
+                Err(e) => { warn!(adapter = %a.name, ipv6 = v6, error = %e, "could not read DNS settings"); None }
             };
-            let (v4, v6) = match current() {
-                Ok(c) => c,
-                Err(e) => { warn!(adapter = %a.name, error = %e, "could not read DNS settings"); continue; }
-            };
-            let set_v4 = v4 != [OURS_V4];
+            let v4 = read(false);
+            let v6 = if ipv6 { read(true) } else { None };
+            let set_v4 = v4.as_ref().is_some_and(|v| v != &[OURS_V4]);
             let set_v6 = v6.as_ref().is_some_and(|v| v != &[OURS_V6]);
             if !set_v4 && !set_v6 {
                 continue;
@@ -218,15 +252,15 @@ mod win {
             let i = match saved.iter().position(|s| s.guid == a.guid_str || (s.guid.is_empty() && s.index == a.index)) {
                 Some(i) => i,
                 None => {
-                    saved.push(Saved { guid: a.guid_str.clone(), index: a.index, name: a.name.clone(), original: vec![], original_v6: None });
+                    saved.push(Saved { guid: a.guid_str.clone(), index: a.index, name: a.name.clone(), original: None, original_v6: None });
                     saved.len() - 1
                 }
             };
             let s = &mut saved[i];
             s.guid = a.guid_str.clone();
             s.index = a.index;
-            if set_v4 {
-                s.original = without(v4, OURS_V4);
+            if let (true, Some(v4)) = (set_v4, v4) {
+                s.original = Some(without(v4, OURS_V4));
             }
             if let (true, Some(v6)) = (set_v6, v6) {
                 s.original_v6 = Some(without(v6, OURS_V6));
@@ -240,12 +274,12 @@ mod win {
         // Save originals first, so a crash mid-way can still be undone.
         save_state(&saved)?;
         for (a, set_v4, set_v6) in &todo {
-            let mut r = Ok(());
-            if *set_v4 { r = set_static(a.guid, false, &[OURS_V4.into()]); }
-            if *set_v6 && r.is_ok() { r = set_static(a.guid, true, &[OURS_V6.into()]); }
-            match r {
-                Ok(()) => info!(adapter = %a.name, "DNS now points at Foxhole"),
-                Err(e) => warn!(adapter = %a.name, error = %e, "could not set DNS"),
+            for (v6, ours, wanted) in [(false, OURS_V4, *set_v4), (true, OURS_V6, *set_v6)] {
+                if !wanted { continue; }
+                match set_static(a.guid, v6, &[ours.into()]) {
+                    Ok(()) => info!(adapter = %a.name, ipv6 = v6, "DNS now points at Foxhole"),
+                    Err(e) => warn!(adapter = %a.name, ipv6 = v6, error = %e, "could not set DNS"),
+                }
             }
         }
         flush();
@@ -253,26 +287,41 @@ mod win {
     }
 
     pub fn restore() -> Result<()> {
-        let live = adapters().unwrap_or_default();
-        let mut failed = Vec::new();
-        for s in load_state() {
+        let present = adapters(false).unwrap_or_default();
+        let mut pending = Vec::new();
+        for mut s in load_state() {
             // State files from older versions only have the interface index.
-            let guid = parse_guid(&s.guid).or_else(|| live.iter().find(|a| a.index == s.index).map(|a| a.guid));
-            let Some(guid) = guid else {
-                warn!(adapter = %s.name, "adapter not present; will retry restoring it later");
-                failed.push(s);
+            let guid_str = if s.guid.is_empty() {
+                present.iter().find(|a| a.index == s.index).map(|a| a.guid_str.clone()).unwrap_or_default()
+            } else {
+                s.guid.clone()
+            };
+            let Some(guid) = parse_guid(&guid_str) else {
+                warn!(adapter = %s.name, "adapter not found; cannot restore its DNS settings");
                 continue;
             };
-            let r = set_static(guid, false, &s.original)
-                .and_then(|_| s.original_v6.as_ref().map_or(Ok(()), |v6| set_static(guid, true, v6)));
-            match r {
-                Ok(()) => info!(adapter = %s.name, "DNS restored"),
-                Err(e) => { warn!(adapter = %s.name, error = %e, "could not restore DNS"); failed.push(s); }
+            let mut keep = false;
+            for v6 in [false, true] {
+                let slot = if v6 { &mut s.original_v6 } else { &mut s.original };
+                let Some(orig) = slot.as_ref() else { continue };
+                let r = match set_static(guid, v6, orig) {
+                    Ok(()) => Ok(true),
+                    // Not present right now: fix its stored configuration instead.
+                    Err(e) => set_static_registry(&guid_str, v6, orig).map_err(|e2| e.context(e2)),
+                };
+                match r {
+                    Ok(true) => { info!(adapter = %s.name, ipv6 = v6, "DNS restored"); *slot = None; }
+                    Ok(false) => *slot = None, // the adapter was removed from Windows: nothing left to fix
+                    Err(e) => { warn!(adapter = %s.name, ipv6 = v6, error = %e, "could not restore DNS; will retry"); keep = true; }
+                }
+            }
+            if keep {
+                pending.push(s);
             }
         }
-        // Safety sweep: nothing may be left pointing at loopback (e.g. the state file was lost),
-        // or the machine would be left with a dead resolver once we stop.
-        for a in &live {
+        // Safety sweep over every present adapter, up or not: nothing may be left pointing at loopback
+        // (e.g. the state file was lost), or the machine would have a dead resolver once we stop.
+        for a in &present {
             for (v6, ours) in [(false, OURS_V4), (true, OURS_V6)] {
                 let Ok(cur) = get_static(a.guid, v6) else { continue };
                 if cur.iter().any(|s| s == ours) {
@@ -283,7 +332,7 @@ mod win {
                 }
             }
         }
-        save_state(&failed)?;
+        save_state(&pending)?;
         flush();
         Ok(())
     }
