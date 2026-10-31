@@ -1,0 +1,40 @@
+[package]
+name = "foxhole"
+version = "0.1.0"
+edition = "2021"
+description = "One-click DNS ad blocker for Windows (AdGuard-style lists, Hagezi Pro++ by default)"
+
+[[bin]]
+name = "foxhole"
+path = "src/main.rs"
+
+[[bin]]
+name = "foxhole-tray"
+path = "src/bin/foxhole-tray.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hickory-proto = "0.24"
+# native-tls = Windows SChannel: uses the Windows certificate store, no C toolchain needed
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+# tray app (src/bin/foxhole-tray.rs); tray-icon 0.19 pairs with tao 0.30
+tray-icon = "0.19"
+tao = "0.30"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
