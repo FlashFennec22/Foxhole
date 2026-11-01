@@ -4,7 +4,7 @@ Foxhole is a simple set-and-forget ad blocker for Windows 11 which operates at t
 
 ## How does it work?
 
-Foxhole checks your outgoing DNS requests against an always up-to-date blocklist. If the connection points at a known advertising domain, Foxhole simply refuses the connection so the ad doesn't load. DNS requests are routed to Cloudflare over HTTPS by default. If Cloudflare goes down, Foxhole temporarily falls back to Quad9. If HTTPS-Over-DNS fails, it falls back to basic UDP. Blocking is provided by the Hagezi Pro+ blocklist, which attempts to block known trackers and malware in addition to advertisements.
+Foxhole checks your outgoing DNS requests against an always up-to-date blocklist. If the connection points at a known advertising domain, Foxhole simply refuses the connection so the ad doesn't load. DNS requests are routed to Cloudflare over HTTPS by default. If Cloudflare goes down, Foxhole temporarily falls back to Quad9. If HTTPS-Over-DNS fails, it falls back to basic UDP. Blocking is provided by the Hagezi Pro+ blocklist, which attempts to block known trackers and malware domains in addition to advertisements.
 
 ## Does it work on everything?
 
