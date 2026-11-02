@@ -36,3 +36,15 @@ Config / cache / logs: `%ProgramData%\Foxhole\` (config.toml, lists\, dns-state.
 (from `%ProgramData%\Foxhole\stats.json`, written by the service every 10 s), and toggles protection by
 starting/stopping the service. The installer grants interactive users start/stop (not reconfigure) rights on the service.
 Menu "Turn protection off" stops the service until the next reboot; `foxhole off` keeps it off across reboots.
+
+## Updates
+The tray checks GitHub's latest release once a day (menu: "Check for updates", and a checkbox to turn the
+daily check off; settings in `HKCU\Software\Foxhole`). A newer version pops up once; after that the menu
+item reads "Install Foxhole x.y.z…". Installing downloads the release's `Foxhole-Setup-*.exe` to
+`%LOCALAPPDATA%\Foxhole\updates\`, checks it against the SHA-256 digest GitHub shows for the asset, and
+runs it with `/SILENT` (Windows asks for admin rights). Releases without such an exe get the release page instead.
+
+To publish a release the checker can use:
+1. Bump `version` in `Cargo.toml` **first**: the installer and the update check both read it from the exe.
+2. Build the exes and the installer (above).
+3. Tag it `vX.Y.Z` and attach `installer\Output\Foxhole-Setup-X.Y.Z.exe` itself (not zipped) to the release.
