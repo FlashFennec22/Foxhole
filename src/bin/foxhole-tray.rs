@@ -14,13 +14,20 @@ fn main() {
 mod trayctl;
 
 #[cfg(windows)]
+#[path = "../update.rs"]
+mod update;
+
+#[cfg(windows)]
 fn main() {
     app::run();
 }
 
 #[cfg(windows)]
 mod app {
-    use crate::trayctl;
+    use crate::{
+        trayctl,
+        update::{self, Release, Version},
+    };
     use serde::Deserialize;
     use std::{
         ffi::OsString,
@@ -28,8 +35,10 @@ mod app {
         os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
         path::PathBuf,
         process::Command,
+        ptr,
+        sync::atomic::{AtomicBool, Ordering},
         thread,
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tao::{
         event::Event,
@@ -43,11 +52,20 @@ mod app {
         service::{ServiceAccess, ServiceState},
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
-    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE, SYNCHRONIZATION_SYNCHRONIZE};
+    use windows_sys::Win32::{
+        System::Threading::{WaitForSingleObject, INFINITE, SYNCHRONIZATION_SYNCHRONIZE},
+        UI::WindowsAndMessaging::{
+            MessageBoxW, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+            MB_TOPMOST, MB_YESNO, MESSAGEBOX_STYLE,
+        },
+    };
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
     const SERVICE_NAME: &str = "Foxhole";
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    /// Per-user tray settings (the update checker's).
+    const SETTINGS_KEY: &str = r"Software\Foxhole";
+    const UPDATE_CHECK_EVERY_SECS: u64 = 24 * 60 * 60;
 
     #[derive(Clone, Copy, PartialEq)]
     enum SvcState {
@@ -74,6 +92,10 @@ mod app {
         Menu(MenuEvent),
         Status(Snapshot),
         Error(String),
+        /// A newer release is out.
+        UpdateAvailable(Release),
+        /// Downloading/starting an update began (true) or ended without the installer closing us (false).
+        UpdateBusy(bool),
         /// The installer asked every tray icon to exit.
         Quit,
     }
@@ -172,6 +194,119 @@ mod app {
         }
     }
 
+    // ---------- update checks (settings in HKCU\Software\Foxhole) ----------
+
+    fn settings() -> Option<RegKey> {
+        RegKey::predef(HKEY_CURRENT_USER).create_subkey(SETTINGS_KEY).ok().map(|(k, _)| k)
+    }
+
+    fn auto_update_enabled() -> bool {
+        settings().and_then(|k| k.get_value::<u32, _>("CheckForUpdates").ok()).map_or(true, |v| v != 0)
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    }
+
+    fn update_check_due() -> bool {
+        let last = settings().and_then(|k| k.get_value::<u64, _>("LastUpdateCheck").ok()).unwrap_or(0);
+        let now = now_secs();
+        now < last || now - last >= UPDATE_CHECK_EVERY_SECS // `now < last`: the clock was set back
+    }
+
+    /// The last version the user was asked about without asking for it; each version pops up once.
+    fn prompted_version() -> Option<String> {
+        settings()?.get_value::<String, _>("LastPromptedVersion").ok()
+    }
+
+    fn set_setting(name: &str, value: &impl winreg::types::ToRegValue) {
+        if let Some(k) = settings() {
+            let _ = k.set_value(name, value);
+        }
+    }
+
+    /// One update check or install at a time (an automatic prompt can be open while the menu is clicked).
+    static UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
+
+    struct UpdateGuard;
+
+    impl UpdateGuard {
+        fn take() -> Option<Self> {
+            (!UPDATE_BUSY.swap(true, Ordering::AcqRel)).then_some(UpdateGuard)
+        }
+    }
+
+    impl Drop for UpdateGuard {
+        fn drop(&mut self) {
+            UPDATE_BUSY.store(false, Ordering::Release);
+        }
+    }
+
+    /// Blocks until dismissed, so call it from a worker thread, never the event loop.
+    fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
+        let text = trayctl::wide(text);
+        let title = trayctl::wide("Foxhole");
+        unsafe { MessageBoxW(ptr::null_mut(), text.as_ptr(), title.as_ptr(), style | MB_SETFOREGROUND | MB_TOPMOST) }
+    }
+
+    /// Worker thread. `manual`: the user asked, so always answer, even "up to date" or an error.
+    fn check_for_updates(proxy: &EventLoopProxy<UserEvent>, manual: bool) {
+        let current = Version::current();
+        let release = match update::latest() {
+            Ok(r) => r,
+            Err(e) => {
+                if manual {
+                    message_box(&format!("Couldn't check for updates.\n\n{e:#}"), MB_OK | MB_ICONWARNING);
+                }
+                return; // an automatic check retries within the hour
+            }
+        };
+        set_setting("LastUpdateCheck", &now_secs());
+        if release.version <= current {
+            if manual {
+                message_box(&format!("Foxhole is up to date (version {current})."), MB_OK | MB_ICONINFORMATION);
+            }
+            return;
+        }
+        let _ = proxy.send_event(UserEvent::UpdateAvailable(release.clone()));
+        // Pop up once per version on our own; after that the menu item is the reminder.
+        let seen = release.version.to_string();
+        if manual || prompted_version().as_deref() != Some(seen.as_str()) {
+            set_setting("LastPromptedVersion", &seen);
+            if ask_to_install(&release) {
+                install(proxy, &release);
+            }
+        }
+    }
+
+    fn ask_to_install(release: &Release) -> bool {
+        let notes = if release.notes.is_empty() { String::new() } else { format!("What's new:\n{}\n\n", release.notes) };
+        let action = if release.installer.is_some() {
+            "Download and install it now? Windows will ask for permission to make changes."
+        } else {
+            "Open the download page?"
+        };
+        let text = format!("Foxhole {} is available. You have {}.\n\n{notes}{action}", release.version, Version::current());
+        message_box(&text, MB_YESNO | MB_ICONQUESTION) == IDYES
+    }
+
+    /// Worker thread. Downloads, verifies and starts the installer, which then closes this tray.
+    fn install(proxy: &EventLoopProxy<UserEvent>, release: &Release) {
+        if release.installer.is_none() {
+            // No installer exe with a published checksum on this release: let the user get it.
+            if let Err(e) = update::open_page(&release.page) {
+                message_box(&format!("Couldn't open the download page.\n\n{e:#}"), MB_OK | MB_ICONWARNING);
+            }
+            return;
+        }
+        let _ = proxy.send_event(UserEvent::UpdateBusy(true));
+        // `run` returns false if the UAC prompt was declined; nothing to report then.
+        if let Err(e) = update::download(release, &local_dir().join("updates")).and_then(|i| i.run()) {
+            message_box(&format!("Couldn't install the update.\n\n{e:#}"), MB_OK | MB_ICONWARNING);
+        }
+        let _ = proxy.send_event(UserEvent::UpdateBusy(false));
+    }
+
     // ---------- UI helpers ----------
 
     fn fmt_num(n: u64) -> String {
@@ -234,6 +369,8 @@ mod app {
         let toggle_item = MenuItem::new("Please wait…", false, None);
         let folder_item = MenuItem::new("Open data folder", true, None);
         let autostart_item = CheckMenuItem::new("Start with Windows", true, autostart_enabled(), None);
+        let update_item = MenuItem::new("Check for updates", true, None);
+        let auto_update_item = CheckMenuItem::new("Check for updates automatically", true, auto_update_enabled(), None);
         let quit_item = MenuItem::new("Quit tray icon", true, None);
 
         let menu = Menu::new();
@@ -245,6 +382,9 @@ mod app {
             &folder_item,
             &autostart_item,
             &PredefinedMenuItem::separator(),
+            &update_item,
+            &auto_update_item,
+            &PredefinedMenuItem::separator(),
             &quit_item,
         ])
         .expect("building menu");
@@ -252,6 +392,8 @@ mod app {
         let toggle_id = toggle_item.id().clone();
         let folder_id = folder_item.id().clone();
         let autostart_id = autostart_item.id().clone();
+        let update_id = update_item.id().clone();
+        let auto_update_id = auto_update_item.id().clone();
         let quit_id = quit_item.id().clone();
 
         let mut tray = Some(TrayIconBuilder::new()
@@ -289,7 +431,29 @@ mod app {
             });
         }
 
+        // Check for updates once a day; look hourly whether one is due (and to retry after failures).
+        {
+            let p = proxy.clone();
+            thread::spawn(move || {
+                // Give the network a minute after sign-in before the first check.
+                thread::sleep(Duration::from_secs(60));
+                loop {
+                    if auto_update_enabled() && update_check_due() {
+                        if let Some(_busy) = UpdateGuard::take() {
+                            check_for_updates(&p, false);
+                        }
+                    }
+                    thread::sleep(Duration::from_secs(60 * 60));
+                }
+            });
+        }
+
         let mut current = SvcState::Transition;
+        let mut available: Option<Release> = None;
+        let update_text = |available: &Option<Release>| match available {
+            Some(r) => format!("Install Foxhole {}…", r.version),
+            None => "Check for updates".to_string(),
+        };
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -353,6 +517,16 @@ mod app {
                 UserEvent::Error(msg) => {
                     status_item.set_text(format!("Couldn't change protection: {msg}"));
                 }
+                UserEvent::UpdateAvailable(release) => {
+                    available = Some(release);
+                    if update_item.is_enabled() {
+                        update_item.set_text(update_text(&available));
+                    }
+                }
+                UserEvent::UpdateBusy(busy) => {
+                    update_item.set_enabled(!busy);
+                    update_item.set_text(if busy { "Downloading update…".to_string() } else { update_text(&available) });
+                }
                 UserEvent::Menu(me) => {
                     if me.id == toggle_id {
                         let start = match current {
@@ -367,6 +541,19 @@ mod app {
                         let _ = Command::new("explorer").arg(data_dir()).spawn();
                     } else if me.id == autostart_id {
                         set_autostart(autostart_item.is_checked());
+                    } else if me.id == update_id {
+                        // Clicking "Install Foxhole x.y.z…" is the user's yes; otherwise check now.
+                        let p = proxy.clone();
+                        let release = available.clone();
+                        thread::spawn(move || {
+                            let Some(_busy) = UpdateGuard::take() else { return };
+                            match release {
+                                Some(r) => install(&p, &r),
+                                None => check_for_updates(&p, true),
+                            }
+                        });
+                    } else if me.id == auto_update_id {
+                        set_setting("CheckForUpdates", &(auto_update_item.is_checked() as u32));
                     } else if me.id == quit_id {
                         tray = None;
                         *control_flow = ControlFlow::Exit;
