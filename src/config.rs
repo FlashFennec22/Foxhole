@@ -89,12 +89,13 @@ impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
             timeout_ms: 1500,
-            fallback: vec!["1.1.1.1:53".parse().unwrap(), "9.9.9.9:53".parse().unwrap()],
+            fallback: vec!["1.1.1.2:53".parse().unwrap(), "9.9.9.9:53".parse().unwrap()],
             doh: vec![
+                // Cloudflare for Families "Security": filters known malware/phishing domains.
                 DohServer {
-                    url: "https://cloudflare-dns.com/dns-query".into(),
-                    host: "cloudflare-dns.com".into(),
-                    ips: vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()],
+                    url: "https://security.cloudflare-dns.com/dns-query".into(),
+                    host: "security.cloudflare-dns.com".into(),
+                    ips: vec!["1.1.1.2".parse().unwrap(), "1.0.0.2".parse().unwrap()],
                 },
                 DohServer {
                     url: "https://dns.quad9.net/dns-query".into(),

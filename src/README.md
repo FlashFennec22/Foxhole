@@ -1,7 +1,7 @@
 # Foxhole (draft)
 
 Local DNS ad blocker for Windows. Ingests AdGuard-style (`||domain^`), hosts and plain-domain lists;
-defaults to **Hagezi Pro++**. Upstream DNS is DoH (Cloudflare) with a plain-UDP fallback.
+defaults to **Hagezi Pro++**. Upstream DNS is DoH (Cloudflare Security) with a plain-UDP fallback.
 
 Requires Windows 10 version 2004 or later (x64).
 
