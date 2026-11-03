@@ -19,7 +19,7 @@ embed-resource = "3"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-hickory-proto = "0.24"
+hickory-proto = "0.26"
 # native-tls = Windows SChannel: uses the Windows certificate store, no C toolchain needed.
 # native-tls-alpn is required for HTTP/2: without ALPN, reqwest can only speak HTTP/1.1 over
 # native-tls, so concurrent DoH queries each need their own TLS connection instead of sharing one.
