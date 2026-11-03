@@ -468,10 +468,16 @@ mod app {
         let auto_update_id = auto_update_item.id().clone();
         let quit_id = quit_item.id().clone();
 
+        // Drawn once up front; cloning an Icon shares the same handle.
+        let icon_on = make_icon([46, 160, 67], true);
+        let icon_off = make_icon([128, 128, 128], false);
+        let icon_working = make_icon([230, 160, 30], false);
+        let icon_missing = make_icon([200, 60, 60], false);
+
         let mut tray = Some(TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Foxhole")
-            .with_icon(make_icon([128, 128, 128], false))
+            .with_icon(icon_off.clone())
             .build()
             .expect("creating tray icon"));
 
@@ -521,6 +527,8 @@ mod app {
         }
 
         let mut current = SvcState::Transition;
+        // The state whose icon is showing; the stats change every few seconds, the icon rarely.
+        let mut shown: Option<SvcState> = None;
         let mut available: Option<Release> = None;
         let update_text = |available: &Option<Release>| match available {
             Some(r) => format!("Install Foxhole {}…", r.version),
@@ -548,31 +556,34 @@ mod app {
                                 ),
                                 _ => "Protection on".to_string(),
                             };
-                            (make_icon([46, 160, 67], true), "Foxhole — protection on", text, "Turn protection off", true)
+                            (&icon_on, "Foxhole — protection on", text, "Turn protection off", true)
                         }
                         SvcState::Stopped => (
-                            make_icon([128, 128, 128], false),
+                            &icon_off,
                             "Foxhole — protection off",
                             "Protection off".to_string(),
                             "Turn protection on",
                             true,
                         ),
                         SvcState::Transition => (
-                            make_icon([230, 160, 30], false),
+                            &icon_working,
                             "Foxhole — working…",
                             "Working…".to_string(),
                             "Please wait…",
                             false,
                         ),
                         SvcState::NotInstalled => (
-                            make_icon([200, 60, 60], false),
+                            &icon_missing,
                             "Foxhole — not installed",
                             "Not installed — run the Foxhole installer".to_string(),
                             "Turn protection on",
                             false,
                         ),
                     };
-                    let _ = tray_icon.set_icon(Some(img));
+                    if shown != Some(snap.state) {
+                        let _ = tray_icon.set_icon(Some(img.clone()));
+                        shown = Some(snap.state);
+                    }
                     let _ = tray_icon.set_tooltip(Some(tip));
                     status_item.set_text(status);
                     rules_item.set_text(match &snap.stats {
