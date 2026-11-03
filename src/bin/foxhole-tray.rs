@@ -321,20 +321,92 @@ mod app {
         out
     }
 
-    /// Flat disc icon generated at runtime (no asset files). `dot` adds a white centre.
-    fn make_icon(rgb: [u8; 3], dot: bool) -> Icon {
-        const N: u32 = 32;
-        let c = (N as f32 - 1.0) / 2.0;
-        let mut px = Vec::with_capacity((N * N * 4) as usize);
-        for y in 0..N {
-            for x in 0..N {
-                let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
-                let a = ((15.5 - d).clamp(0.0, 1.0) * 255.0) as u8;
-                let (r, g, b) = if dot && d < 5.5 { (255, 255, 255) } else { (rgb[0], rgb[1], rgb[2]) };
-                px.extend_from_slice(&[r, g, b, a]);
+    // Fox head, drawn at runtime (no asset files). Shapes are in a unit square, y pointing down,
+    // and symmetric about x = 0.5; the eye is given for the left side and mirrored.
+    const FOX_HEAD: &[(f32, f32)] = &[
+        (0.05, 0.02), (0.36, 0.28), (0.64, 0.28), (0.95, 0.02), // ear tips and the top of the head
+        (0.91, 0.44), (1.00, 0.62), (0.60, 0.88), (0.50, 0.98), // right cheek, snout
+        (0.40, 0.88), (0.00, 0.62), (0.09, 0.44), // left cheek
+    ];
+    /// Light cheeks and chin.
+    const FOX_MUZZLE: &[(f32, f32)] = &[(0.00, 0.62), (0.30, 0.63), (0.50, 0.74), (0.70, 0.63), (1.00, 0.62), (0.50, 0.98)];
+    /// The tip of the snout keeps the head colour, inside the muzzle.
+    const FOX_NOSE: &[(f32, f32)] = &[(0.40, 0.86), (0.60, 0.86), (0.50, 0.98)];
+    /// Cut out (transparent), so the eyes work on light and dark taskbars alike.
+    const FOX_EYE: &[(f32, f32)] = &[(0.22, 0.45), (0.43, 0.52), (0.35, 0.58)];
+    /// A sleepy, closed eye: a thin downward curve.
+    const FOX_EYE_SHUT: &[(f32, f32)] = &[(0.22, 0.50), (0.33, 0.55), (0.43, 0.50), (0.43, 0.555), (0.33, 0.605), (0.22, 0.555)];
+
+    /// Even-odd point-in-polygon test.
+    fn inside(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
+        let mut hit = false;
+        let mut j = poly.len() - 1;
+        for i in 0..poly.len() {
+            let ((xi, yi), (xj, yj)) = (poly[i], poly[j]);
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                hit = !hit;
+            }
+            j = i;
+        }
+        hit
+    }
+
+    /// `n`×`n` RGBA pixels (straight alpha), 4×4 samples per pixel for smooth edges.
+    fn fox_rgba(n: u32, rgb: [u8; 3], muzzle: [u8; 3], eyes_open: bool) -> Vec<u8> {
+        const SS: u32 = 4;
+        let eye = if eyes_open { FOX_EYE } else { FOX_EYE_SHUT };
+        let mut px = Vec::with_capacity((n * n * 4) as usize);
+        for py in 0..n {
+            for pxl in 0..n {
+                let (mut sum, mut hits) = ([0u32; 3], 0u32);
+                for sy in 0..SS {
+                    for sx in 0..SS {
+                        let x = (pxl as f32 + (sx as f32 + 0.5) / SS as f32) / n as f32;
+                        let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / n as f32;
+                        if !inside(FOX_HEAD, x, y) || inside(eye, x, y) || inside(eye, 1.0 - x, y) {
+                            continue;
+                        }
+                        let light = inside(FOX_MUZZLE, x, y) && !inside(FOX_NOSE, x, y);
+                        let c = if light { muzzle } else { rgb };
+                        for k in 0..3 {
+                            sum[k] += c[k] as u32;
+                        }
+                        hits += 1;
+                    }
+                }
+                let a = (hits * 255 / (SS * SS)) as u8;
+                let c = |k: usize| if hits == 0 { 0 } else { (sum[k] / hits) as u8 };
+                px.extend_from_slice(&[c(0), c(1), c(2), a]);
             }
         }
-        Icon::from_rgba(px, N, N).expect("valid icon buffer")
+        px
+    }
+
+    /// `rgb` mixed `t` of the way to white.
+    fn tint(rgb: [u8; 3], t: f32) -> [u8; 3] {
+        rgb.map(|c| (c as f32 + (255.0 - c as f32) * t) as u8)
+    }
+
+    /// The fox in `rgb` with a lighter muzzle. `on`: eyes open; otherwise shut, so the state
+    /// shows by more than colour alone (green and red are easy to confuse).
+    fn make_icon(rgb: [u8; 3], on: bool) -> Icon {
+        const N: u32 = 32;
+        Icon::from_rgba(fox_rgba(N, rgb, tint(rgb, 0.6), on), N, N).expect("valid icon buffer")
+    }
+
+    /// Writes raw RGBA previews of every state at common tray sizes, for checking changes to the
+    /// shapes: `cargo test --bin foxhole-tray -- --ignored icon_preview`
+    #[test]
+    #[ignore]
+    fn icon_preview() {
+        let dir = std::env::temp_dir().join("foxhole-icon-preview");
+        std::fs::create_dir_all(&dir).unwrap();
+        let states = [("on", [46, 160, 67], true), ("off", [128, 128, 128], false), ("working", [230, 160, 30], false), ("missing", [200, 60, 60], false)];
+        for (name, rgb, on) in states {
+            for n in [16, 20, 24, 32, 128] {
+                std::fs::write(dir.join(format!("{name}-{n}.rgba")), fox_rgba(n, rgb, tint(rgb, 0.6), on)).unwrap();
+            }
+        }
     }
 
     pub fn run() {

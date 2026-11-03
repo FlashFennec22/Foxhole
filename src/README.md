@@ -32,7 +32,8 @@ Config / cache / logs: `%ProgramData%\Foxhole\` (config.toml, lists\, dns-state.
 4. Lists refresh every 24h; the last good cache is kept if a download fails.
 
 ## Tray icon
-`foxhole-tray.exe` (unelevated, no console window) shows green/grey/amber/red status, blocked-query counts
+`foxhole-tray.exe` (unelevated, no console window) shows a fox head coloured by status (green with eyes open = on;
+eyes shut: grey = off, amber = working, red = not installed), blocked-query counts
 (from `%ProgramData%\Foxhole\stats.json`, written by the service every 10 s), and toggles protection by
 starting/stopping the service. The installer grants interactive users start/stop (not reconfigure) rights on the service.
 Menu "Turn protection off" stops the service until the next reboot; `foxhole off` keeps it off across reboots.
