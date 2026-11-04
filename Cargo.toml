@@ -1,6 +1,6 @@
 [package]
 name = "foxhole"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "One-click DNS ad blocker for Windows (AdGuard-style lists, Hagezi Pro++ by default)"
 
@@ -20,6 +20,8 @@ embed-resource = "3"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hickory-proto = "0.24"
+# Verifies the signature on update manifests (src/update.rs). Pure Rust, no dependencies.
+minisign-verify = "0.3"
 # native-tls = Windows SChannel: uses the Windows certificate store, no C toolchain needed.
 # native-tls-alpn is required for HTTP/2: without ALPN, reqwest can only speak HTTP/1.1 over
 # native-tls, so concurrent DoH queries each need their own TLS connection instead of sharing one.
@@ -27,7 +29,7 @@ hickory-proto = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["native-tls-alpn", "http2", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Verifies downloaded installers against the SHA-256 digest GitHub publishes for release assets.
+# Checks downloaded installers against the SHA-256 digest in the signed update manifest.
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
 toml = "0.8"

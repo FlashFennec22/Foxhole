@@ -44,11 +44,31 @@ Menu "Turn protection off" stops the service until the next reboot; `foxhole off
 ## Updates
 The tray checks GitHub's latest release once a day (menu: "Check for updates", and a checkbox to turn the
 daily check off; settings in `HKCU\Software\Foxhole`). A newer version pops up once; after that the menu
-item reads "Install Foxhole x.y.z…". Installing downloads the release's `Foxhole-Setup-*.exe` to
-`%LOCALAPPDATA%\Foxhole\updates\`, checks it against the SHA-256 digest GitHub shows for the asset, and
-runs it with `/SILENT` (Windows asks for admin rights). Releases without such an exe get the release page instead.
+item reads "Install Foxhole x.y.z…". Installing downloads the release's installer to
+`%LOCALAPPDATA%\Foxhole\updates\`, checks it against the signed SHA-256 digest (below), and runs it with
+`/SILENT` (Windows asks for admin rights).
+
+### Update signing
+Updates are signed with an offline [minisign](https://jedisct1.github.io/minisign/) (Ed25519) key, so
+control of the GitHub repository or account isn't enough to push an update. Each release carries
+`foxhole-update.json` (version, installer name, size, SHA-256, notes) and its signature. The tray verifies
+that against `resources/update-signing.pub`, compiled into the exe, before showing or doing anything. Nothing
+else GitHub says is trusted, and a release with a missing or invalid signature is never offered.
+
+One-time setup (the build needs `resources/update-signing.pub`; `winget install jedisct1.minisign`):
+
+    minisign -G -p resources\update-signing.pub -s <somewhere outside this repo>\foxhole.key
+
+Commit the `.pub` file. **Keep the `.key` file and its password out of this repository and off GitHub,
+including Actions secrets**, and keep a backup: without the key, installed copies can't receive updates
+and users must reinstall by hand. To replace the key, publish a release signed with the old key that
+contains the new `.pub` file; versions after it are then signed with the new key.
 
 To publish a release the checker can use:
-1. Bump `version` in `Cargo.toml` **first**: the installer and the update check both read it from the exe.
+1. Bump `version` in `Cargo.toml` **first**: the installer reads it from the exe.
 2. Build the exes and the installer (above).
-3. Tag it `vX.Y.Z` and attach `installer\Output\Foxhole-Setup-X.Y.Z.exe` itself (not zipped) to the release.
+3. Sign it: `.\installer\sign-release.ps1 -SecretKey <path>\foxhole.key -NotesFile notes.txt`
+4. Tag it `vX.Y.Z` and attach `Foxhole-Setup-X.Y.Z.exe` (not zipped), `foxhole-update.json` and
+   `foxhole-update.json.minisig` from `installer\Output\` to the release.
+
+Versions before signing don't check any of this, so they stay exposed until they update to a signed version.
