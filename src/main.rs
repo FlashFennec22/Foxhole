@@ -1,4 +1,6 @@
 mod config;
+#[cfg(windows)]
+mod datadir;
 mod dns;
 mod engine;
 mod lists;
@@ -108,6 +110,19 @@ fn run_foreground(manage_dns: bool) -> Result<()> {
     })
 }
 
+/// Secures the data folder, then starts logging into it. The error is logged too, because this is
+/// where someone would look; a planted log file can't do more harm than receive that one message.
+#[cfg(windows)]
+fn secure_data_dir() -> Result<()> {
+    let r = datadir::secure();
+    init_logging(true);
+    datadir::log_notes();
+    if let Err(e) = &r {
+        tracing::error!(error = %format!("{e:#}"), "could not secure the data folder");
+    }
+    r
+}
+
 #[cfg(not(windows))]
 fn windows_cmd(_: Cmd, _: bool) -> Result<()> {
     anyhow::bail!("this command is only available on Windows (use `run --no-system-dns` to test elsewhere)")
@@ -156,6 +171,13 @@ fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
         Cmd::Off => {
             if let Some(code) = elevate(&["off"])? { std::process::exit(code as i32); }
             init_logging(false);
+            // Restoring DNS reads dns-state.json, so check the folder first. A failure is no reason
+            // to leave the machine's DNS pointed at a stopped resolver.
+            let secured = datadir::secure();
+            datadir::log_notes();
+            if let Err(e) = secured {
+                tracing::warn!(error = %format!("{e:#}"), "could not secure the data folder");
+            }
             winctl::turn_off()?;
             println!("Foxhole is OFF. Your original DNS settings were restored.");
             Ok(())
@@ -171,17 +193,20 @@ fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
             Ok(())
         }
         Cmd::Service => {
-            init_logging(true);
+            // Before the log file or config are touched. Refuse to run on files we can't trust.
+            secure_data_dir()?;
             service::dispatch().map_err(Into::into)
         }
         // Run by the (already elevated) installer with no console; details go to foxhole.log.
         Cmd::InstallService { .. } | Cmd::PrepareUpgrade | Cmd::UninstallService => {
-            init_logging(true);
             if !winctl::is_admin() {
+                init_logging(false);
                 anyhow::bail!("this command is for the installer and needs administrator rights");
             }
+            let secured = secure_data_dir();
             let r = match cmd {
-                Cmd::InstallService { off } => winctl::install_service(off),
+                // Removal carries on regardless, but never start protection on an unsafe folder.
+                Cmd::InstallService { off } => secured.and_then(|()| winctl::install_service(off)),
                 Cmd::PrepareUpgrade => winctl::prepare_upgrade(),
                 _ => winctl::uninstall_service(),
             };
