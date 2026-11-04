@@ -23,6 +23,9 @@ and shows the tray icon. Uninstall from Settings > Apps, which also restores you
     foxhole run --no-system-dns   # foreground debug mode on 127.0.0.1:53, no install needed
 
 Config / cache / logs: `%ProgramData%\Foxhole\` (config.toml, lists\, dns-state.json, foxhole.log).
+Only SYSTEM and Administrators can write there, so editing config.toml takes an elevated editor. The installer
+and the service enforce this: anything in the folder not owned by SYSTEM or Administrators is removed when the
+service starts, and an untrusted config.toml is renamed to config.toml.untrusted.
 
 ## How it works
 1. Service (auto-start, auto-restart) listens on 127.0.0.1:53 and [::1]:53 (UDP+TCP).
