@@ -146,7 +146,6 @@ pub fn latest() -> Result<Release> {
     let body = client
         .get(LATEST_URL)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .and_then(|r| r.error_for_status())
         .context("asking GitHub for the latest release")?
