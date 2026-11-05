@@ -281,24 +281,13 @@ mod app {
 
     fn ask_to_install(release: &Release) -> bool {
         let notes = if release.notes.is_empty() { String::new() } else { format!("What's new:\n{}\n\n", release.notes) };
-        let action = if release.installer.is_some() {
-            "Download and install it now? Windows will ask for permission to make changes."
-        } else {
-            "Open the download page?"
-        };
+        let action = "Download and install it now? Windows will ask for permission to make changes.";
         let text = format!("Foxhole {} is available. You have {}.\n\n{notes}{action}", release.version, Version::current());
         message_box(&text, MB_YESNO | MB_ICONQUESTION) == IDYES
     }
 
     /// Worker thread. Downloads, verifies and starts the installer, which then closes this tray.
     fn install(proxy: &EventLoopProxy<UserEvent>, release: &Release) {
-        if release.installer.is_none() {
-            // No installer exe with a published checksum on this release: let the user get it.
-            if let Err(e) = update::open_page(&release.page) {
-                message_box(&format!("Couldn't open the download page.\n\n{e:#}"), MB_OK | MB_ICONWARNING);
-            }
-            return;
-        }
         let _ = proxy.send_event(UserEvent::UpdateBusy(true));
         // `run` returns false if the UAC prompt was declined; nothing to report then.
         if let Err(e) = update::download(release, &local_dir().join("updates")).and_then(|i| i.run()) {
