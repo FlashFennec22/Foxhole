@@ -1,6 +1,6 @@
 [package]
 name = "foxhole"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "One-click DNS ad blocker for Windows (AdGuard-style lists, Hagezi Pro++ by default)"
 
