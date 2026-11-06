@@ -19,7 +19,7 @@ embed-resource = "3"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-hickory-proto = "0.24"
+hickory-proto = "0.26"
 # Verifies the signature on update manifests (src/update.rs). Pure Rust, no dependencies.
 minisign-verify = "0.3"
 # native-tls = Windows SChannel: uses the Windows certificate store, no C toolchain needed.
