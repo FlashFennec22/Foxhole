@@ -66,12 +66,16 @@ mod app {
     /// Per-user tray settings (the update checker's).
     const SETTINGS_KEY: &str = r"Software\Foxhole";
     const UPDATE_CHECK_EVERY_SECS: u64 = 24 * 60 * 60;
+    /// The service's reason for not starting is cut to this length in the notice (the log has it all).
+    const MAX_REASON_CHARS: usize = 300;
 
     #[derive(Clone, Copy, PartialEq)]
     enum SvcState {
         NotInstalled,
         Running,
         Stopped,
+        /// It couldn't start and is waiting to try again (the service reports this as PAUSED).
+        Retrying,
         Transition,
     }
 
@@ -82,10 +86,21 @@ mod app {
         rules: u64,
     }
 
+    /// The note the service leaves in `start-failed.json` when it gives up trying to start.
+    #[derive(Deserialize, Clone, PartialEq)]
+    struct StartFailure {
+        /// When it gave up (Unix seconds); tells one failure from the next.
+        at: u64,
+        attempts: u32,
+        error: String,
+    }
+
     #[derive(Clone, PartialEq)]
     struct Snapshot {
         state: SvcState,
         stats: Option<Stats>,
+        /// Why protection is off, if it is off because the service couldn't start.
+        failure: Option<StartFailure>,
     }
 
     enum UserEvent {
@@ -128,6 +143,7 @@ mod app {
         match svc.query_status().map(|s| s.current_state) {
             Ok(ServiceState::Running) => SvcState::Running,
             Ok(ServiceState::Stopped) => SvcState::Stopped,
+            Ok(ServiceState::Paused) => SvcState::Retrying,
             Ok(_) => SvcState::Transition,
             Err(_) => SvcState::NotInstalled,
         }
@@ -138,10 +154,42 @@ mod app {
         serde_json::from_str(&text).ok()
     }
 
+    fn read_start_failure() -> Option<StartFailure> {
+        let text = std::fs::read_to_string(data_dir().join("start-failed.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
     fn snapshot() -> Snapshot {
         let state = svc_state();
         let stats = if state == SvcState::Running { read_stats() } else { None };
-        Snapshot { state, stats }
+        // The service removes the note once it starts; while it is still trying, an old one is stale.
+        let failure = if state == SvcState::Stopped { read_start_failure() } else { None };
+        Snapshot { state, stats, failure }
+    }
+
+    /// Tells the user, once per failure, that the service gave up trying to start. The menu keeps
+    /// saying so afterwards. Per user (HKCU), so everyone who signs in gets to hear about it.
+    fn notify_start_failure(failure: &StartFailure) {
+        let shown = settings().and_then(|k| k.get_value::<u64, _>("LastStartFailureShown").ok());
+        if shown == Some(failure.at) {
+            return;
+        }
+        set_setting("LastStartFailureShown", &failure.at);
+        let reason = match failure.error.char_indices().nth(MAX_REASON_CHARS) {
+            Some((cut, _)) => format!("{}…", &failure.error[..cut]),
+            None => failure.error.clone(),
+        };
+        let text = format!(
+            "Foxhole couldn't start, so ads and trackers aren't being blocked. Your internet connection isn't affected.\n\n\
+             Reason: {reason}\n\n\
+             It tried {} times. To try again, click the Foxhole icon and choose \"Turn protection on\". \
+             Details are in {}.",
+            failure.attempts,
+            data_dir().join("foxhole.log").display()
+        );
+        thread::spawn(move || {
+            message_box(&text, MB_OK | MB_ICONWARNING);
+        });
     }
 
     fn control(start: bool) -> Result<(), windows_service::Error> {
@@ -550,8 +598,18 @@ mod app {
                         SvcState::Stopped => (
                             &icon_off,
                             "Foxhole — protection off",
-                            "Protection off".to_string(),
+                            match &snap.failure {
+                                Some(_) => "Protection off — Foxhole couldn't start".to_string(),
+                                None => "Protection off".to_string(),
+                            },
                             "Turn protection on",
+                            true,
+                        ),
+                        SvcState::Retrying => (
+                            &icon_working,
+                            "Foxhole — couldn't start, trying again",
+                            "Couldn't start — trying again shortly".to_string(),
+                            "Stop trying",
                             true,
                         ),
                         SvcState::Transition => (
@@ -581,6 +639,9 @@ mod app {
                     });
                     toggle_item.set_text(toggle);
                     toggle_item.set_enabled(enabled);
+                    if let Some(failure) = &snap.failure {
+                        notify_start_failure(failure);
+                    }
                 }
                 UserEvent::Quit => {
                     tray = None;
@@ -603,7 +664,8 @@ mod app {
                     if me.id == toggle_id {
                         let start = match current {
                             SvcState::Stopped => true,
-                            SvcState::Running => false,
+                            // Stopping it while it waits to try again calls the retries off.
+                            SvcState::Running | SvcState::Retrying => false,
                             _ => return,
                         };
                         toggle_item.set_enabled(false);

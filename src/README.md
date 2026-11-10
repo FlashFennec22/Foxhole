@@ -33,6 +33,11 @@ service starts, and an untrusted config.toml is renamed to config.toml.untrusted
 3. Active adapters are pointed at loopback; originals are saved first and restored on stop/off.
    Adapters that appear or change later (Wi-Fi, VPN, docking) are picked up within seconds.
 4. Lists refresh every 24h; the last good cache is kept if a download fails.
+5. If the service can't start (bad config.toml, port 53 in use), it puts the original DNS settings back,
+   so the PC stays online, and tries again after 10, 30, 60 and 120 seconds. `foxhole off` or the tray's
+   "Stop trying" ends that early. After the fifth failed attempt it stops and writes `start-failed.json`,
+   which the tray icon shows to each signed-in user once; protection then stays off until it is turned on
+   again or Windows restarts.
 
 ## Tray icon
 `foxhole-tray.exe` (unelevated, no console window) shows a fox head coloured by status (green with eyes open = on;

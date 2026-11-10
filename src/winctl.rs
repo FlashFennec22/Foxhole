@@ -101,13 +101,21 @@ fn open(access: ServiceAccess) -> Option<Service> {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Status { NotInstalled, Running, Stopped, Other }
+pub enum Status {
+    NotInstalled,
+    Running,
+    Stopped,
+    /// It couldn't start and is waiting to try again (the service reports this as PAUSED).
+    Retrying,
+    Other,
+}
 
 pub fn status() -> Status {
     let Some(svc) = open(ServiceAccess::QUERY_STATUS) else { return Status::NotInstalled };
     match svc.query_status().map(|s| s.current_state) {
         Ok(ServiceState::Running) => Status::Running,
         Ok(ServiceState::Stopped) => Status::Stopped,
+        Ok(ServiceState::Paused) => Status::Retrying,
         Ok(_) => Status::Other,
         Err(_) => Status::NotInstalled,
     }
@@ -323,7 +331,12 @@ pub fn turn_on() -> Result<()> {
     }
     let started = svc.start::<OsString>(&[]);
     // The service reports RUNNING only once it is listening on port 53, and stops if it can't.
-    if wait_settled(30) != Status::Running {
+    let outcome = wait_settled(30);
+    if outcome == Status::Retrying {
+        bail!("Foxhole couldn't start. It will try again a few times over the next few minutes; \
+               `foxhole off` stops that. See %ProgramData%\\Foxhole\\foxhole.log");
+    }
+    if outcome != Status::Running {
         let why = started.err().map(|e| format!("\n{e}")).unwrap_or_default();
         bail!("service did not start. See %ProgramData%\\Foxhole\\foxhole.log{why}");
     }
@@ -340,5 +353,7 @@ pub fn turn_off() -> Result<()> {
         }
     }
     let restored = sysdns::restore(); // idempotent safety net in case the service died uncleanly
+    // Off on purpose now, so an earlier "couldn't start" is no longer news.
+    crate::service::clear_start_failure();
     result.and(restored)
 }
