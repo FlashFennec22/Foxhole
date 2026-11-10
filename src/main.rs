@@ -187,6 +187,7 @@ fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
             println!("{}", match winctl::status() {
                 Status::Running => "ON (service running)",
                 Status::Stopped => "OFF (service stopped)",
+                Status::Retrying => "OFF (couldn't start; trying again shortly)",
                 Status::NotInstalled => "not installed",
                 Status::Other => "starting/stopping",
             });
@@ -194,7 +195,15 @@ fn windows_cmd(cmd: Cmd, elevated: bool) -> Result<()> {
         }
         Cmd::Service => {
             // Before the log file or config are touched. Refuse to run on files we can't trust.
-            secure_data_dir()?;
+            if let Err(e) = secure_data_dir() {
+                // The adapters may still point at us from a run that never restored them. The saved
+                // originals are in the folder we couldn't secure, so don't read them: just take our
+                // addresses off, rather than leave the machine with a resolver that isn't there.
+                if let Err(e) = sysdns::clear_loopback() {
+                    tracing::error!(error = %format!("{e:#}"), "could not take Foxhole out of the DNS settings; run `foxhole off`");
+                }
+                return Err(e);
+            }
             service::dispatch().map_err(Into::into)
         }
         // Run by the (already elevated) installer with no console; details go to foxhole.log.

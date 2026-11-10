@@ -6,7 +6,7 @@
 //! or from `foxhole off`. An empty saved list means "the adapter used DHCP".
 
 #[cfg(windows)]
-pub use win::{apply, restore, Watcher};
+pub use win::{apply, clear_loopback, restore, Watcher};
 #[cfg(not(windows))]
 pub use stub::{apply, restore, Watcher};
 
@@ -319,9 +319,16 @@ mod win {
                 pending.push(s);
             }
         }
-        // Safety sweep over every present adapter, up or not: nothing may be left pointing at loopback
-        // (e.g. the state file was lost), or the machine would have a dead resolver once we stop.
-        for a in &present {
+        sweep(&present);
+        save_state(&pending)?;
+        flush();
+        Ok(())
+    }
+
+    /// Safety sweep over every present adapter, up or not: nothing may be left pointing at loopback
+    /// (e.g. the state file was lost), or the machine would have a dead resolver once we stop.
+    fn sweep(present: &[Adapter]) {
+        for a in present {
             for (v6, ours) in [(false, OURS_V4), (true, OURS_V6)] {
                 let Ok(cur) = get_static(a.guid, v6) else { continue };
                 if cur.iter().any(|s| s == ours) {
@@ -332,7 +339,13 @@ mod win {
                 }
             }
         }
-        save_state(&pending)?;
+    }
+
+    /// `restore` for when dns-state.json can't be trusted: takes our addresses off every present
+    /// adapter without reading the saved originals, so an adapter that had only us falls back to
+    /// DHCP / automatic. The state file is left alone for a later `restore`.
+    pub fn clear_loopback() -> Result<()> {
+        sweep(&adapters(false)?);
         flush();
         Ok(())
     }
