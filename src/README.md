@@ -30,6 +30,9 @@ service starts, and an untrusted config.toml is renamed to config.toml.untrusted
 ## How it works
 1. Service (auto-start, auto-restart) listens on 127.0.0.1:53 and [::1]:53 (UDP+TCP).
 2. Blocked names (domain + all subdomains) get 0.0.0.0 / :: (A / AAAA) or an empty NOERROR; everything else is forwarded upstream.
+   Upstream answers are kept in a 2 MB in-memory cache (least recently used dropped first) for as long as their TTL
+   allows, capped at 1 day (1 hour for "no such name"). It is never written to disk and is emptied on network changes.
+   Hit/miss counts go to `stats.json` (`cache_hits`, `cache_misses`, `cache_entries`).
 3. Active adapters are pointed at loopback; originals are saved first and restored on stop/off.
    Adapters that appear or change later (Wi-Fi, VPN, docking) are picked up within seconds.
 4. Lists refresh every 24h; the last good cache is kept if a download fails.
