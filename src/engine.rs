@@ -53,6 +53,8 @@ pub async fn run(cfg: Config, shutdown: Arc<Notify>, manage_dns: bool, on_ready:
             _ = shutdown.notified() => break,
             _ = tick.tick() => {}
             _ = async { match &watcher { Some(w) => w.changed().await, None => std::future::pending().await } } => {
+                // CDN answers depend on where we are; after a network change, ask again.
+                state.cache.clear();
                 // Changes arrive in bursts (link up, DHCP, IPv6 autoconfiguration): let them settle,
                 // without delaying a shutdown that arrives meanwhile.
                 tokio::select! {
@@ -71,7 +73,13 @@ pub async fn run(cfg: Config, shutdown: Arc<Notify>, manage_dns: bool, on_ready:
     }
     drop(watcher);
 
-    info!(total = state.total.load(Relaxed), blocked = state.blocked.load(Relaxed), "shutting down");
+    info!(
+        total = state.total.load(Relaxed),
+        blocked = state.blocked.load(Relaxed),
+        cache_hits = state.cache.hits.load(Relaxed),
+        cache_misses = state.cache.misses.load(Relaxed),
+        "shutting down"
+    );
     if manage_dns {
         if let Ok(Err(e)) = tokio::task::spawn_blocking(sysdns::restore).await {
             warn!(error = %e, "failed to restore DNS settings; run `foxhole off`");
@@ -108,10 +116,13 @@ async fn stats_writer(state: Arc<State>) {
     loop {
         tick.tick().await;
         let json = format!(
-            r#"{{"total":{},"blocked":{},"rules":{}}}"#,
+            r#"{{"total":{},"blocked":{},"rules":{},"cache_hits":{},"cache_misses":{},"cache_entries":{}}}"#,
             state.total.load(Relaxed),
             state.blocked.load(Relaxed),
-            state.rule_count()
+            state.rule_count(),
+            state.cache.hits.load(Relaxed),
+            state.cache.misses.load(Relaxed),
+            state.cache.len()
         );
         if tokio::fs::write(&tmp, json).await.is_ok() {
             let _ = tokio::fs::rename(&tmp, &path).await;

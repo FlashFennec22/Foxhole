@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 #[cfg(windows)]
 mod datadir;

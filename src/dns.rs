@@ -1,4 +1,4 @@
-use crate::{rules::Matcher, upstream::Upstream};
+use crate::{cache::{self, Cache}, rules::Matcher, upstream::Upstream};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{rdata::{A, AAAA}, RData, Record, RecordType};
 use std::{
@@ -18,13 +18,20 @@ const BLOCK_TTL: u32 = 300;
 pub struct State {
     matcher: RwLock<Arc<Matcher>>,
     upstream: Upstream,
+    pub cache: Cache,
     pub total: AtomicU64,
     pub blocked: AtomicU64,
 }
 
 impl State {
     pub fn new(matcher: Matcher, upstream: Upstream) -> Self {
-        Self { matcher: RwLock::new(Arc::new(matcher)), upstream, total: AtomicU64::new(0), blocked: AtomicU64::new(0) }
+        Self {
+            matcher: RwLock::new(Arc::new(matcher)),
+            upstream,
+            cache: Cache::new(cache::DEFAULT_CAPACITY),
+            total: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
+        }
     }
     pub fn set_matcher(&self, m: Matcher) {
         *self.matcher.write().unwrap() = Arc::new(m);
@@ -60,11 +67,12 @@ fn blocked_response(req: &Message, q: &Query) -> Option<Vec<u8>> {
     resp.to_vec().ok()
 }
 
-/// Core logic shared by UDP and TCP: block locally or forward upstream.
+/// Core logic shared by UDP and TCP: block locally, answer from the cache, or forward upstream.
 async fn handle(packet: &[u8], state: &State) -> Option<Vec<u8>> {
     let req = Message::from_vec(packet).ok()?;
     state.total.fetch_add(1, Relaxed);
 
+    let mut cache_key = None;
     if req.message_type == MessageType::Query && req.op_code == OpCode::Query && req.queries.len() == 1 {
         let q = &req.queries[0];
         let name = q.name().to_ascii().trim_end_matches('.').to_ascii_lowercase();
@@ -78,10 +86,21 @@ async fn handle(packet: &[u8], state: &State) -> Option<Vec<u8>> {
             debug!(%name, "blocked");
             return blocked_response(&req, q);
         }
+        // Checked after the blocklist, so a list update applies to cached names straight away.
+        let key = cache::Key::new(&req, &name);
+        if let Some(resp) = state.cache.get(&key, &req) {
+            return Some(resp);
+        }
+        cache_key = Some(key);
     }
 
     match state.upstream.resolve(packet).await {
-        Ok(r) => Some(r),
+        Ok(r) => {
+            if let Some(key) = cache_key {
+                state.cache.insert(key, &req, &r);
+            }
+            Some(r)
+        }
         Err(e) => {
             debug!(error = %e, "upstream failure");
             base_response(&req, ResponseCode::ServFail).to_vec().ok()
